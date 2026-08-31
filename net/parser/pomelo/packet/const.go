@@ -20,8 +20,13 @@ const (
 )
 
 var (
-	HeadLength    = 4       // 4 bytes
-	MaxPacketSize = 1 << 24 // 16mb
+	HeadLength = 4 // 4 bytes
+
+	// ReadMaxPacketSize max packet size for reading (receive), defaults to 16MB.
+	// Protocol header length field is 3 bytes, max 1<<24.
+	ReadMaxPacketSize = 1 << 24
+	// WriteMaxPacketSize max packet size for writing (send), defaults to 16MB.
+	WriteMaxPacketSize = 1 << 24
 
 	packetTypes = map[Type]string{
 		None:         "None",
@@ -54,7 +59,7 @@ func ParseHeader(header []byte) (int, error) {
 
 	size := BytesToInt(header[1:])
 
-	if size > MaxPacketSize {
+	if size > ReadMaxPacketSize {
 		return 0, cerr.PacketSizeExceed
 	}
 
@@ -91,7 +96,7 @@ func forward(buf *bytes.Buffer) (int, Type, error) {
 	size := BytesToInt(header[1:])
 
 	// packet length limitation
-	if size > MaxPacketSize {
+	if size > ReadMaxPacketSize {
 		return 0, None, cerr.PacketSizeExceed
 	}
 

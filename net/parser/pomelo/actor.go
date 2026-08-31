@@ -125,6 +125,24 @@ func (*Actor) SetWriteBacklog(size int) {
 	cmd.writeBacklog = size
 }
 
+// SetReadMaxPacketSize sets the max packet size for reading (client->server).
+// Packets exceeding this size return PacketSizeExceed. Defaults to 16MB.
+func (*Actor) SetReadMaxPacketSize(size int) {
+	if size <= 0 {
+		size = 1 << 24
+	}
+	ppacket.ReadMaxPacketSize = size
+}
+
+// SetWriteMaxPacketSize sets the max packet size for writing (server->client).
+// Packets exceeding this size return PacketSizeExceed. Defaults to 16MB.
+func (*Actor) SetWriteMaxPacketSize(size int) {
+	if size <= 0 {
+		size = 1 << 24
+	}
+	ppacket.WriteMaxPacketSize = size
+}
+
 // SetHeartbeat sets the heartbeat interval. Values less than 1 second default to 60 seconds.
 func (*Actor) SetHeartbeat(t time.Duration) {
 	if t.Seconds() < 1 {

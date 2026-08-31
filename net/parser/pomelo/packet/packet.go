@@ -89,7 +89,7 @@ func Encode(typ byte, data []byte) ([]byte, error) {
 		return nil, cerr.PacketWrongType
 	}
 
-	if len(data) > MaxPacketSize {
+	if len(data) > WriteMaxPacketSize {
 		return nil, cerr.PacketSizeExceed
 	}
 
