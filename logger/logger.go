@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	cfacade "github.com/cherry-game/cherry/facade"
+	cprofile "github.com/cherry-game/cherry/profile"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -44,6 +45,9 @@ func SetNodeLogger(node cfacade.INode) {
 
 	defaultManager.SetCommonField(KEY_NODE_TYPE, node.NodeType())
 	defaultManager.SetCommonField(KEY_NODE_ID, node.NodeID())
+	if env := cprofile.Env(); env != "" {
+		defaultManager.SetCommonField("env", env)
+	}
 
 	DefaultLogger = defaultManager.GetOrCreateLogger(refLoggerName, zap.AddCallerSkip(1))
 }
@@ -100,7 +104,7 @@ func SetPrintLevel(level zapcore.Level) {
 }
 
 // GetLevel converts a level name string to a zapcore.Level. Supported values
-// (case-insensitive): "debug", "info", "warn", "error", "panic", "fatal".
+// (case-insensitive): "debug", "info", "warn", "error", "dpanic", "panic", "fatal".
 // Unknown values default to DebugLevel.
 func GetLevel(level string) zapcore.Level {
 	switch strings.ToLower(level) {
@@ -112,6 +116,8 @@ func GetLevel(level string) zapcore.Level {
 		return zapcore.WarnLevel
 	case "error":
 		return zapcore.ErrorLevel
+	case "dpanic":
+		return zapcore.DPanicLevel
 	case "panic":
 		return zapcore.PanicLevel
 	case "fatal":

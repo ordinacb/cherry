@@ -1,6 +1,8 @@
 package cherryLogger
 
 import (
+	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,6 +35,8 @@ func TestGetLevel(t *testing.T) {
 		{"ERROR", zapcore.ErrorLevel},
 		{"panic", zapcore.PanicLevel},
 		{"PANIC", zapcore.PanicLevel},
+		{"dpanic", zapcore.DPanicLevel},
+		{"DPANIC", zapcore.DPanicLevel},
 		{"fatal", zapcore.FatalLevel},
 		{"FATAL", zapcore.FatalLevel},
 		{"", zapcore.DebugLevel},
@@ -256,26 +260,26 @@ func TestConfig_TimeEncoder(t *testing.T) {
 
 type testPrimitiveArrayEncoder struct{ appended []string }
 
-func (t *testPrimitiveArrayEncoder) AppendBool(bool)                  {}
-func (t *testPrimitiveArrayEncoder) AppendByteString([]byte)          {}
-func (t *testPrimitiveArrayEncoder) AppendComplex128(complex128)      {}
-func (t *testPrimitiveArrayEncoder) AppendComplex64(complex64)        {}
-func (t *testPrimitiveArrayEncoder) AppendDuration(d time.Duration)     {}
-func (t *testPrimitiveArrayEncoder) AppendFloat64(f float64)           {}
-func (t *testPrimitiveArrayEncoder) AppendFloat32(f float32)           {}
-func (t *testPrimitiveArrayEncoder) AppendInt(i int)                   {}
-func (t *testPrimitiveArrayEncoder) AppendInt64(i int64)               {}
-func (t *testPrimitiveArrayEncoder) AppendInt32(i int32)               {}
-func (t *testPrimitiveArrayEncoder) AppendInt16(i int16)               {}
-func (t *testPrimitiveArrayEncoder) AppendInt8(i int8)                 {}
-func (t *testPrimitiveArrayEncoder) AppendString(s string)             { t.appended = append(t.appended, s) }
-func (t *testPrimitiveArrayEncoder) AppendTime(tm time.Time)           {}
-func (t *testPrimitiveArrayEncoder) AppendUint(uint)                  {}
-func (t *testPrimitiveArrayEncoder) AppendUint64(uint64)              {}
-func (t *testPrimitiveArrayEncoder) AppendUint32(uint32)              {}
-func (t *testPrimitiveArrayEncoder) AppendUint16(uint16)              {}
-func (t *testPrimitiveArrayEncoder) AppendUint8(uint8)                {}
-func (t *testPrimitiveArrayEncoder) AppendUintptr(uintptr)            {}
+func (t *testPrimitiveArrayEncoder) AppendBool(bool)                {}
+func (t *testPrimitiveArrayEncoder) AppendByteString([]byte)        {}
+func (t *testPrimitiveArrayEncoder) AppendComplex128(complex128)    {}
+func (t *testPrimitiveArrayEncoder) AppendComplex64(complex64)      {}
+func (t *testPrimitiveArrayEncoder) AppendDuration(d time.Duration) {}
+func (t *testPrimitiveArrayEncoder) AppendFloat64(f float64)        {}
+func (t *testPrimitiveArrayEncoder) AppendFloat32(f float32)        {}
+func (t *testPrimitiveArrayEncoder) AppendInt(i int)                {}
+func (t *testPrimitiveArrayEncoder) AppendInt64(i int64)            {}
+func (t *testPrimitiveArrayEncoder) AppendInt32(i int32)            {}
+func (t *testPrimitiveArrayEncoder) AppendInt16(i int16)            {}
+func (t *testPrimitiveArrayEncoder) AppendInt8(i int8)              {}
+func (t *testPrimitiveArrayEncoder) AppendString(s string)          { t.appended = append(t.appended, s) }
+func (t *testPrimitiveArrayEncoder) AppendTime(tm time.Time)        {}
+func (t *testPrimitiveArrayEncoder) AppendUint(uint)                {}
+func (t *testPrimitiveArrayEncoder) AppendUint64(uint64)            {}
+func (t *testPrimitiveArrayEncoder) AppendUint32(uint32)            {}
+func (t *testPrimitiveArrayEncoder) AppendUint16(uint16)            {}
+func (t *testPrimitiveArrayEncoder) AppendUint8(uint8)              {}
+func (t *testPrimitiveArrayEncoder) AppendUintptr(uintptr)          {}
 
 func TestConfig_EnableWriteFile_AutoDefaults(t *testing.T) {
 	config := defaultConfig
@@ -619,6 +623,70 @@ func TestJSONEncoder(t *testing.T) {
 	)
 
 	t.Log("JSON encoder test completed")
+}
+
+func TestJSONEncoder_LokiContract(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stdout
+	os.Stdout = w
+	t.Cleanup(func() { os.Stdout = old })
+
+	done := make(chan []byte, 1)
+	go func() {
+		raw, _ := io.ReadAll(r)
+		done <- raw
+	}()
+
+	config := defaultConsoleConfig()
+	config.EncoderType = ENCODER_JSON_Type
+	config.EnableConsole = false
+	config.IncludeStdout = true
+	config.PrintCaller = true
+	config.StackLevel = "dpanic"
+
+	logger := NewConfigLogger(config, map[string]string{
+		"service":  "game",
+		"env":      "test",
+		"nodetype": "gate",
+		"nodeid":   "bl-gate-1",
+	}, nil)
+	logger.Infow("player_online", "uid", int64(42))
+	_ = logger.Sync()
+	_ = w.Close()
+	os.Stdout = old
+
+	raw := <-done
+	line := strings.TrimSpace(string(raw))
+	if line == "" {
+		t.Fatal("expected one JSON log line on stdout")
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(line), &m); err != nil {
+		t.Fatalf("json: %v\n%s", err, line)
+	}
+	for _, key := range []string{"time", "level", "msg", "caller", "service", "env", "nodetype", "nodeid", "uid"} {
+		if _, ok := m[key]; !ok {
+			t.Errorf("missing key %q in %s", key, line)
+		}
+	}
+	if _, ok := m["ts"]; ok {
+		t.Errorf("legacy key ts must not appear: %s", line)
+	}
+	if m["level"] != "info" {
+		t.Errorf("level = %v, want info", m["level"])
+	}
+	if m["msg"] != "player_online" {
+		t.Errorf("msg = %v, want player_online", m["msg"])
+	}
+	if m["uid"] != float64(42) {
+		t.Errorf("uid = %v, want 42", m["uid"])
+	}
+	if _, ok := m["stack"]; ok {
+		t.Errorf("info must not include stack: %s", line)
+	}
 }
 
 func TestConsoleEncoder(t *testing.T) {

@@ -33,7 +33,7 @@ func buildEncoder(encoderType string, cfg zapcore.EncoderConfig, commonFields ma
 // during package initialization (e.g. from NewManager).
 func NewConfigLogger(config Config, commonFields map[string]string, wrappers []Wrapper, opts ...zap.Option) *CherryLogger {
 	encoderConfig := zapcore.EncoderConfig{
-		TimeKey:        "ts",
+		TimeKey:        "time",
 		LevelKey:       "level",
 		CallerKey:      "caller",
 		MessageKey:     "msg",
@@ -42,13 +42,14 @@ func NewConfigLogger(config Config, commonFields map[string]string, wrappers []W
 		LineEnding:     zapcore.DefaultLineEnding,
 		EncodeDuration: zapcore.StringDurationEncoder,
 		EncodeCaller:   zapcore.ShortCallerEncoder,
+		EncodeLevel:    zapcore.LowercaseLevelEncoder,
 	}
 
-	encoderConfig.EncodeLevel = func(level zapcore.Level, encoder zapcore.PrimitiveArrayEncoder) {
-		encoder.AppendString(level.CapitalString())
+	if strings.EqualFold(config.EncoderType, ENCODER_JSON_Type) {
+		encoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
+	} else {
+		encoderConfig.EncodeTime = config.TimeEncoder()
 	}
-
-	encoderConfig.EncodeTime = config.TimeEncoder()
 
 	if config.PrintCaller {
 		encoderConfig.EncodeName = zapcore.FullNameEncoder

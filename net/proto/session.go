@@ -1,6 +1,8 @@
 package cherryProto
 
 import (
+	"sync"
+
 	cconst "github.com/cherry-game/cherry/const"
 	cstring "github.com/cherry-game/cherry/extend/string"
 )
@@ -8,6 +10,24 @@ import (
 const (
 	MIDKey = "mid"
 )
+
+// sessionMu guards every access to Session.Data.
+//
+// A session is shared by two goroutines by design. The agent's read loop
+// stamps the message id onto it before dispatching each request, while the
+// backend actors that request reaches write their own keys into it — a bound
+// uid, a table id, the node holding the player. Neither side knows about the
+// other, and the map underneath had no protection, so a request arriving while
+// an actor was writing crashed the whole process with "concurrent map writes".
+// It needs the two to overlap within the same microsecond, which is why it
+// only showed up once a login grew slow enough to still be finishing when the
+// client's next request landed.
+//
+// One lock for all sessions rather than one per session, because Session is a
+// generated protobuf type with no room for a mutex field, and because the
+// critical sections are single map operations. Contention is a map lookup
+// wide; the alternative is a process-wide crash.
+var sessionMu sync.RWMutex
 
 func (x *Session) IsBind() bool {
 	return x.Uid > 0
@@ -18,14 +38,29 @@ func (x *Session) ActorPath() string {
 }
 
 func (x *Session) Add(key string, value interface{}) {
-	x.Data[key] = cstring.ToString(value)
+	x.Set(key, cstring.ToString(value))
 }
 
 func (x *Session) Remove(key string) {
+	sessionMu.Lock()
+	defer sessionMu.Unlock()
+
 	delete(x.Data, key)
 }
 
 func (x *Session) Set(key string, value string) {
+	if key == "" || value == "" {
+		return
+	}
+
+	sessionMu.Lock()
+	defer sessionMu.Unlock()
+
+	x.set(key, value)
+}
+
+// set writes without locking, for callers already holding the lock.
+func (x *Session) set(key string, value string) {
 	if key == "" || value == "" {
 		return
 	}
@@ -42,17 +77,26 @@ func (x *Session) GetMID() uint32 {
 }
 
 func (x *Session) ImportAll(data map[string]string) {
+	sessionMu.Lock()
+	defer sessionMu.Unlock()
+
 	for k, v := range data {
-		x.Set(k, v)
+		x.set(k, v)
 	}
 }
 
 func (x *Session) Contains(key string) bool {
+	sessionMu.RLock()
+	defer sessionMu.RUnlock()
+
 	_, found := x.Data[key]
 	return found
 }
 
 func (x *Session) Equal(key, value string) bool {
+	sessionMu.RLock()
+	defer sessionMu.RUnlock()
+
 	dataValue, found := x.Data[key]
 	if !found {
 		return false
@@ -62,22 +106,41 @@ func (x *Session) Equal(key, value string) bool {
 }
 
 func (x *Session) Restore(data map[string]string) {
-	x.Clear()
+	sessionMu.Lock()
+	defer sessionMu.Unlock()
+
+	// Clearing and refilling under one lock, so that no reader can observe the
+	// session empty part-way through a restore.
+	for k := range x.Data {
+		delete(x.Data, k)
+	}
 
 	for k, v := range data {
-		x.Set(k, v)
+		x.set(k, v)
 	}
 }
 
 // Clear releases all settings related to current sc
 func (x *Session) Clear() {
+	sessionMu.Lock()
+	defer sessionMu.Unlock()
+
 	for k := range x.Data {
 		delete(x.Data, k)
 	}
 }
 
-func (x *Session) GetUint(key string) uint {
+// get reads under the shared lock.
+func (x *Session) get(key string) (string, bool) {
+	sessionMu.RLock()
+	defer sessionMu.RUnlock()
+
 	v, ok := x.Data[key]
+	return v, ok
+}
+
+func (x *Session) GetUint(key string) uint {
+	v, ok := x.get(key)
 	if !ok {
 		return 0
 	}
@@ -90,7 +153,7 @@ func (x *Session) GetUint(key string) uint {
 }
 
 func (x *Session) GetInt(key string) int {
-	v, ok := x.Data[key]
+	v, ok := x.get(key)
 	if !ok {
 		return 0
 	}
@@ -104,7 +167,7 @@ func (x *Session) GetInt(key string) int {
 
 // GetInt32 returns the value associated with the key as a int32.
 func (x *Session) GetInt32(key string) int32 {
-	v, ok := x.Data[key]
+	v, ok := x.get(key)
 	if !ok {
 		return 0
 	}
@@ -117,7 +180,7 @@ func (x *Session) GetInt32(key string) int32 {
 }
 
 func (x *Session) GetInt64(key string) int64 {
-	v, ok := x.Data[key]
+	v, ok := x.get(key)
 	if !ok {
 		return 0
 	}
@@ -131,10 +194,6 @@ func (x *Session) GetInt64(key string) int64 {
 
 // GetString returns the value associated with the key as a string.
 func (x *Session) GetString(key string) string {
-	v, ok := x.Data[key]
-	if !ok {
-		return ""
-	}
-
+	v, _ := x.get(key)
 	return v
 }
