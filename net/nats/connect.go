@@ -308,22 +308,29 @@ func (p *Connect) natsOptions() []nats.Option {
 	}))
 
 	opts = append(opts, nats.ReconnectHandler(func(nc *nats.Conn) {
-		clog.Warnf("[name = %s] Reconnected [%s]", p.name, nc.ConnectedUrl())
+		url := ""
+		if nc != nil {
+			url = nc.ConnectedUrl()
+		}
+		clog.Warnf("[name = %s] Reconnected [%s]", p.name, url)
 	}))
 
 	opts = append(opts, nats.ClosedHandler(func(nc *nats.Conn) {
-		if nc.LastError() != nil {
+		if nc != nil && nc.LastError() != nil {
 			clog.Infof("[name = %s] error = %v", p.name, nc.LastError())
 		}
 		p.clearWaiters()
 	}))
 
+	// nats.go flusher invokes this as AsyncErrorCB(nc, nil, err) when a
+	// buffered write fails. sub is also nil for some async protocol errors.
 	opts = append(opts, nats.ErrorHandler(func(nc *nats.Conn, sub *nats.Subscription, err error) {
+		connected, errMsg, subject := asyncErrorFields(nc, sub, err)
 		clog.Warnf("[name = %s] IsConnect = %v. %s on connection for subscription on %q",
 			p.name,
-			nc.IsConnected(),
-			err.Error(),
-			sub.Subject,
+			connected,
+			errMsg,
+			subject,
 		)
 	}))
 
@@ -332,6 +339,19 @@ func (p *Connect) natsOptions() []nats.Option {
 	}
 
 	return opts
+}
+
+func asyncErrorFields(nc *nats.Conn, sub *nats.Subscription, err error) (connected bool, errMsg, subject string) {
+	if nc != nil {
+		connected = nc.IsConnected()
+	}
+	if err != nil {
+		errMsg = err.Error()
+	}
+	if sub != nil {
+		subject = sub.Subject
+	}
+	return
 }
 
 func (p *options) Address() string {
