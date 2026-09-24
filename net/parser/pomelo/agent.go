@@ -175,17 +175,16 @@ func (a *Agent) ResponseMID(mid uint32, v interface{}, isError ...bool) {
 		isErr = isError[0]
 	}
 	a.sendPending(pomeloMessage.Response, "", mid, v, isErr)
-	if clog.PrintLevel(zapcore.DebugLevel) {
-		clog.Debugf("[sid = %s,uid = %d] Response ok. [mid = %d, isError = %v]",
-			a.SID(), a.UID(), mid, isErr)
+	if netLogger != nil {
+		netLogger("response", a.SID(), a.UID(), mid, "", isErr, v)
 	}
 }
 
 // Push sends a server-push message to the client on the given route.
 func (a *Agent) Push(route string, val interface{}) {
 	a.sendPending(pomeloMessage.Push, route, 0, val, false)
-	if clog.PrintLevel(zapcore.DebugLevel) {
-		clog.Debugf("[sid = %s,uid = %d] Push ok. [route = %s]", a.SID(), a.UID(), route)
+	if netLogger != nil {
+		netLogger("push", a.SID(), a.UID(), 0, route, false, val)
 	}
 }
 
@@ -461,6 +460,15 @@ func (a *Agent) sendPending(typ pomeloMessage.Type, route string, mid uint32, v 
 			a.SID(), a.UID(), typ, route, mid, v, isError)
 	}
 }
+
+// NetLogger 由业务注册，用来把回包和推送打成可读文本。
+// payload 在发到 gate 时通常已经是编码后的 []byte。
+type NetLogger func(kind, sid string, uid int64, mid uint32, route string, isError bool, payload any)
+
+var netLogger NetLogger
+
+// SetNetLogger 注册回包和推送的日志函数。重复调用覆盖上一次。
+func SetNetLogger(fn NetLogger) { netLogger = fn }
 
 // RemoteAddr returns the client IP address.
 func (a *Agent) RemoteAddr() string {
