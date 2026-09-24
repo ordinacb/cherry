@@ -1,36 +1,66 @@
 package cherryConnector
 
 import (
-	"fmt"
 	"net"
-	"sync"
 	"testing"
+	"time"
 
-	clog "github.com/cherry-game/cherry/logger"
+	"github.com/gorilla/websocket"
 )
 
-// websocket client http://www.websocket-test.com/
 func TestNewWSConnector(t *testing.T) {
-	wg := &sync.WaitGroup{}
-	wg.Add(1)
+	addr := freeAddr(t)
+	received := make(chan []byte, 1)
 
-	ws := NewWS(":9071")
+	ws := NewWS(addr)
 	ws.OnConnect(func(conn net.Conn) {
-		clog.Infof("new net.Conn = %s", conn.RemoteAddr())
 		go func() {
-			for {
-				buf := make([]byte, 2048)
-				for {
-					n, err := conn.Read(buf)
-					if err != nil {
-						return
-					}
-					fmt.Println(buf[:n])
-				}
+			defer conn.Close()
+			buf := make([]byte, 64)
+			n, err := conn.Read(buf)
+			if err != nil {
+				return
 			}
+			received <- buf[:n]
 		}()
 	})
-	ws.Start()
 
-	wg.Wait()
+	done := make(chan struct{})
+	go func() {
+		ws.Start()
+		close(done)
+	}()
+
+	var client *websocket.Conn
+	var err error
+	for i := 0; i < 50; i++ {
+		if client, _, err = websocket.DefaultDialer.Dial("ws://"+addr+"/", nil); err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+
+	if err := client.WriteMessage(websocket.BinaryMessage, []byte("ping")); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case got := <-received:
+		if string(got) != "ping" {
+			t.Fatalf("expected ping, got %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not receive the frame")
+	}
+
+	ws.Stop()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Start did not return after Stop")
+	}
 }

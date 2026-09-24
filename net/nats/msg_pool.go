@@ -22,8 +22,12 @@ func GetNatsMsg() *nats.Msg {
 	return msg
 }
 
+// ReleaseNatsMsg resets the message and returns it to the pool.
+// The header map is dropped, not cleared: a caller may have assigned its own
+// map, and clearing it would wipe the caller's data. GetNatsMsg allocates a
+// fresh one.
 func ReleaseNatsMsg(natsMsg *nats.Msg) {
-	clear(natsMsg.Header)
+	natsMsg.Header = nil
 	natsMsg.Subject = ""
 	natsMsg.Reply = ""
 	natsMsg.Data = nil

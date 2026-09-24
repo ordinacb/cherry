@@ -187,8 +187,10 @@ func (p *Actor) response(rsp *cproto.PomeloResponse) {
 	if ccode.IsOK(rsp.Code) {
 		agent.ResponseMID(rsp.Mid, rsp.Data, false)
 	} else {
+		// Data carries an optional human-readable message for error codes.
 		errRsp := &cproto.Response{
 			Code: rsp.Code,
+			Data: rsp.Data,
 		}
 		agent.ResponseMID(rsp.Mid, errRsp, true)
 	}

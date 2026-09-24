@@ -131,6 +131,7 @@ func (p *Actor) processLocal() {
 				childActor.PostLocal(m)
 			} else {
 				clog.Warnf("child actor not found. target=%s", m.Target)
+				notifyDrop(p.App(), m, DropChildNotFound)
 			}
 		}
 	} else {
@@ -167,6 +168,7 @@ func (p *Actor) processRemote() {
 				childActor.PostRemote(m)
 			} else {
 				clog.Warnf("child actor not found. target=%s", m.Target)
+				notifyDrop(p.App(), m, DropChildNotFound)
 			}
 		}
 	} else {
@@ -202,6 +204,7 @@ func (p *Actor) invokeFunc(mb *mailbox, app cfacade.IApplication, fn cfacade.Inv
 			m.Target,
 			m.FuncName,
 		)
+		notifyDrop(app, m, DropFuncNotFound)
 		return
 	}
 

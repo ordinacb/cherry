@@ -435,11 +435,13 @@ func (p *System) PostRemote(m *cfacade.Message) bool {
 	targetActor, found := p.GetActor(m.TargetPath().ActorID)
 	if !found {
 		clog.Warnf("[PostRemote] actor not found. [source = %s, target = %s -> %s]", m.Source, m.Target, m.FuncName)
+		notifyDrop(p.app, m, DropActorNotFound)
 		m.Recycle()
 		return false
 	}
 
 	if targetActor.State() != WorkerState {
+		notifyDrop(p.app, m, DropActorNotReady)
 		m.Recycle()
 		return false
 	}
@@ -458,11 +460,13 @@ func (p *System) PostLocal(m *cfacade.Message) bool {
 	targetActor, found := p.GetActor(m.TargetPath().ActorID)
 	if !found {
 		clog.Warnf("[PostLocal] actor not found. [source = %s, target = %s -> %s]", m.Source, m.Target, m.FuncName)
+		notifyDrop(p.app, m, DropActorNotFound)
 		m.Recycle()
 		return false
 	}
 
 	if targetActor.State() != WorkerState {
+		notifyDrop(p.app, m, DropActorNotReady)
 		m.Recycle()
 		return false
 	}
