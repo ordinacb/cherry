@@ -41,6 +41,7 @@ type (
 		replySubject     string             // reply subject base for RequestSync responses
 		publishConnect   *cnats.Connect     // send: Publish/RequestSync/ReplySync
 		subscribeConnect *cnats.Connect     // receive: Subscribe
+		reconcileAt      time.Time          // worker: when to prune members the master no longer knows (clientTicker only)
 	}
 
 	natsSubjects struct {
@@ -212,10 +213,10 @@ func (m *ComponentMaster) addSubscribe() {
 			return
 		}
 
-		if _, ok := m.GetMember(addMember.NodeID); !ok {
-			if addMember.NodeID != m.thisMember.GetNodeID() {
-				m.AddMember(addMember)
-			}
+		// Replace an existing entry too: a node restarted under the same ID
+		// registers again with fresh address/settings.
+		if addMember.NodeID != m.thisMember.GetNodeID() {
+			m.AddMember(addMember)
 		}
 	})
 	if err != nil {
@@ -244,7 +245,20 @@ func (m *ComponentMaster) clientTicker() {
 			// Heartbeat first; if master replies with registerRequired marker,
 			// send a full registration to sync the member list.
 			if m.sendHeartbeat2Master() {
-				m.sendRegister2Master()
+				if m.ctx.Err() != nil {
+					return
+				}
+				m.sendRegister2Master(false)
+				// The master just (re)started and only knows the nodes that have
+				// re-registered so far. Give the rest a few heartbeats to come
+				// back, then drop whatever the master still does not know.
+				m.reconcileAt = time.Now().Add(2*time.Duration(m.thisMember.HeartbeatTimeout)*time.Millisecond + time.Second)
+				continue
+			}
+
+			if !m.reconcileAt.IsZero() && time.Now().After(m.reconcileAt) {
+				m.reconcileAt = time.Time{}
+				m.sendRegister2Master(true)
 			}
 		}
 	}
@@ -273,7 +287,9 @@ func (m *ComponentMaster) sendHeartbeat2Master() bool {
 
 // sendRegister2Master sends a full registration to the master and processes
 // the member list reply, adding any members not yet known locally.
-func (m *ComponentMaster) sendRegister2Master() {
+// With prune, local members absent from the master's list are removed; this
+// clears nodes that died while the master was down and never came back.
+func (m *ComponentMaster) sendRegister2Master(prune bool) {
 	memberBytes, err := m.member2Bytes(m.thisMember)
 	if err != nil {
 		clog.Warnf("[sendRegister2Master] member marshal error. err = %s", err)
@@ -295,7 +311,9 @@ func (m *ComponentMaster) sendRegister2Master() {
 		return
 	}
 
+	known := make(map[string]struct{}, len(memberList.GetList()))
 	for _, member := range memberList.GetList() {
+		known[member.GetNodeID()] = struct{}{}
 		if member.NodeID == m.thisMember.NodeID {
 			continue
 		}
@@ -303,6 +321,30 @@ func (m *ComponentMaster) sendRegister2Master() {
 		if _, ok := m.GetMember(member.GetNodeID()); !ok {
 			m.AddMember(member)
 		}
+	}
+
+	if prune {
+		m.pruneMembers(known)
+	}
+}
+
+// pruneMembers removes local members (other than self) not present in known.
+func (m *ComponentMaster) pruneMembers(known map[string]struct{}) {
+	var stale []string
+	m.memberMap.Range(func(key, _ any) bool {
+		nodeID, ok := key.(string)
+		if !ok || nodeID == m.thisMember.GetNodeID() {
+			return true
+		}
+		if _, found := known[nodeID]; !found {
+			stale = append(stale, nodeID)
+		}
+		return true
+	})
+
+	for _, nodeID := range stale {
+		clog.Infof("[pruneMembers] master no longer knows node, removing. [nodeID = %s]", nodeID)
+		m.RemoveMember(nodeID)
 	}
 }
 
@@ -549,6 +591,18 @@ func (m *ComponentMaster) bytes2NodeID(data []byte) (string, error) {
 		return "", err
 	}
 	return nodeIDProto.Value, nil
+}
+
+// OnBeforeStop tells the cluster this worker is leaving, so peers stop routing
+// to it now instead of after the heartbeat timeout. The ticker is cancelled
+// first so a late heartbeat cannot re-register the node.
+func (m *ComponentMaster) OnBeforeStop() {
+	if m.cancel != nil {
+		m.cancel()
+	}
+	if m.isClient() && m.publishConnect != nil && m.thisMember != nil {
+		m.sendRemove(m.thisMember.NodeID)
+	}
 }
 
 // OnStop closes the nats connects and stops the background goroutines.

@@ -134,8 +134,9 @@ func (a *Agent) SetLastAt() {
 	a.lastAt.Store(ctime.Now().ToSecond())
 }
 
-// SendRaw enqueues raw bytes for writing. Non-blocking; drops data if the
-// agent is closed or the write buffer is full.
+// SendRaw enqueues raw bytes for writing. Non-blocking. If the write buffer
+// is full the connection is closed: silently dropping a response leaves the
+// client waiting on that mid forever, while a close makes it reconnect.
 func (a *Agent) SendRaw(bytes []byte) {
 	if a.IsClosed() {
 		return
@@ -144,6 +145,8 @@ func (a *Agent) SendRaw(bytes []byte) {
 	select {
 	case a.chWrite <- bytes:
 	default:
+		clog.Warnf("[sid = %s,uid = %d] Write buffer full, closing. [len = %d]", a.SID(), a.UID(), len(bytes))
+		a.Close()
 	}
 }
 
@@ -363,7 +366,8 @@ func (a *Agent) writeChan() {
 			return
 		case <-ticker.C:
 			lastAt = a.lastAt.Load()
-			deadline = time.Now().Add(-cmd.heartbeatTime).Unix()
+			// pomelo clients disconnect after 2x the handshake interval; match that.
+			deadline = time.Now().Add(-2 * cmd.heartbeatTime).Unix()
 			if lastAt < deadline {
 				if clog.PrintLevel(zapcore.DebugLevel) {
 					clog.Debugf("[sid = %s,uid = %d] Check heartbeat timeout.", a.SID(), a.UID())
@@ -456,8 +460,9 @@ func (a *Agent) sendPending(typ pomeloMessage.Type, route string, mid uint32, v 
 	select {
 	case a.chPending <- pending:
 	default:
-		clog.Warnf("[sid = %s,uid = %d] send buffer exceed. [typ = %v, route = %s, mid = %d, val = %+v, err = %v]",
-			a.SID(), a.UID(), typ, route, mid, v, isError)
+		clog.Warnf("[sid = %s,uid = %d] send buffer exceed, closing. [typ = %v, route = %s, mid = %d, err = %v]",
+			a.SID(), a.UID(), typ, route, mid, isError)
+		a.Close()
 	}
 }
 

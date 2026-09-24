@@ -261,13 +261,14 @@ func (n *ComponentDefault) OnRemoveMember(listener cfacade.MemberListener) {
 	n.onRemoveListener = append(n.onRemoveListener, listener)
 }
 
-// AddMember inserts a member into the local member table.
-// If the member already exists, logs a debug message but still notifies add listeners.
-// Otherwise stores the new member and notifies all onAddListener callbacks.
+// AddMember inserts a member into the local member table and notifies add listeners.
+// A duplicate nodeID replaces the stored member: a node restarted under the
+// same ID carries a new address/settings, and the map must match what the
+// listeners were given.
 func (n *ComponentDefault) AddMember(member cfacade.IMember) {
-	_, isDuplicate := n.memberMap.LoadOrStore(member.GetNodeID(), member)
+	_, isDuplicate := n.memberMap.Swap(member.GetNodeID(), member)
 	if isDuplicate {
-		clog.Debugf("Add Duplicate Member. [member = %s]", member)
+		clog.Debugf("Replace Member. [member = %s]", member)
 	} else {
 		clog.Debugf("Add Member. [ member = %s]", member)
 	}
@@ -277,13 +278,11 @@ func (n *ComponentDefault) AddMember(member cfacade.IMember) {
 	}
 }
 
-// UpdateMember updates an existing member in the local member table.
-// If the member doesn't exist, it is stored but no update listeners are notified.
-// If the member exists, the stored value is replaced and onUpdateListener callbacks fire.
+// UpdateMember stores the given member. If one already existed under the
+// same nodeID, onUpdateListener callbacks fire with the new value.
 func (n *ComponentDefault) UpdateMember(member *cproto.Member) {
-	value, loaded := n.memberMap.LoadOrStore(member.NodeID, member)
+	_, loaded := n.memberMap.Swap(member.NodeID, member)
 	if loaded {
-		member := value.(cfacade.IMember)
 		clog.Debugf("Update member. [member = %s]", member)
 
 		for _, listener := range n.onUpdateListener {

@@ -308,3 +308,25 @@ func TestComponentMaster_UpdateSettings(t *testing.T) {
 		t.Fatalf("zone mismatch: expected 'a', got '%s'", m.thisMember.Settings["zone"])
 	}
 }
+
+// TestComponentMaster_PruneMembers verifies that members the master no longer
+// knows are dropped, while self and known members stay.
+func TestComponentMaster_PruneMembers(t *testing.T) {
+	m := newTestMaster("gate-1", "master-1")
+	m.thisMember = &cproto.Member{NodeID: "gate-1"}
+	m.memberMap.Store("gate-1", m.thisMember)
+	m.memberMap.Store("account-1", &cproto.Member{NodeID: "account-1"})
+	m.memberMap.Store("account-dead", &cproto.Member{NodeID: "account-dead"})
+
+	m.pruneMembers(map[string]struct{}{"master-1": {}, "account-1": {}})
+
+	if _, ok := m.GetMember("account-dead"); ok {
+		t.Fatal("stale member should be removed")
+	}
+	if _, ok := m.GetMember("account-1"); !ok {
+		t.Fatal("known member should stay")
+	}
+	if _, ok := m.GetMember("gate-1"); !ok {
+		t.Fatal("self must never be pruned")
+	}
+}

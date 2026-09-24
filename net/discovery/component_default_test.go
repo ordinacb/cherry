@@ -120,6 +120,21 @@ func TestComponentDefault_UpdateMember_Existing(t *testing.T) {
 	if !called {
 		t.Fatal("OnUpdateMember listener was not called")
 	}
+	if m, _ := d.GetMember("node-1"); m.GetAddress() != "127.0.0.1:20001" {
+		t.Fatalf("UpdateMember should store the new value, got %s", m.GetAddress())
+	}
+}
+
+// TestComponentDefault_AddMember_ReplacesRestartedNode verifies that a node
+// re-added under the same nodeID replaces the stale entry.
+func TestComponentDefault_AddMember_ReplacesRestartedNode(t *testing.T) {
+	d := &ComponentDefault{}
+	d.AddMember(newTestMember("node-1", "game", "127.0.0.1:10001"))
+	d.AddMember(newTestMember("node-1", "game", "127.0.0.1:20001"))
+
+	if m, _ := d.GetMember("node-1"); m.GetAddress() != "127.0.0.1:20001" {
+		t.Fatalf("expected replaced address, got %s", m.GetAddress())
+	}
 }
 
 // TestComponentDefault_UpdateMember_New verifies that updating a member that doesn't

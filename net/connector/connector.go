@@ -50,6 +50,10 @@ func (p *Connector) Start() {
 func (p *Connector) Stop() {
 	p.running = false
 
+	// listener is nil if Start never ran (e.g. shutdown before listening).
+	if p.listener == nil {
+		return
+	}
 	if err := p.listener.Close(); err != nil {
 		clog.Errorf("Failed to stop: %s", err)
 	}

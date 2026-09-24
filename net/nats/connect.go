@@ -297,9 +297,7 @@ func (p *Connect) natsOptions() []nats.Option {
 		opts = append(opts, nats.ReconnectWait(reconnectDelay))
 	}
 
-	if p.options.maxReconnects > 0 {
-		opts = append(opts, nats.MaxReconnects(p.options.maxReconnects))
-	}
+	opts = append(opts, nats.MaxReconnects(natsMaxReconnects(p.options.maxReconnects)))
 
 	opts = append(opts, nats.DisconnectErrHandler(func(conn *nats.Conn, err error) {
 		if err != nil {
@@ -339,6 +337,17 @@ func (p *Connect) natsOptions() []nats.Option {
 	}
 
 	return opts
+}
+
+// natsMaxReconnects maps the profile value to nats.MaxReconnects.
+// 0 (or unset) means retry forever. Leaving the option out would fall back to
+// nats.DefaultMaxReconnect (60), after which the connection closes for good
+// and cherry never dials again: the whole node is cut off until restart.
+func natsMaxReconnects(configured int) int {
+	if configured == 0 {
+		return -1
+	}
+	return configured
 }
 
 func asyncErrorFields(nc *nats.Conn, sub *nats.Subscription, err error) (connected bool, errMsg, subject string) {

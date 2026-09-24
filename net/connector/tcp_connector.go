@@ -1,6 +1,10 @@
 package cherryConnector
 
 import (
+	"errors"
+	"net"
+	"time"
+
 	cfacade "github.com/cherry-game/cherry/facade"
 	clog "github.com/cherry-game/cherry/logger"
 )
@@ -61,12 +65,24 @@ func (t *TCPConnector) Start() {
 
 	t.Connector.Start()
 
+	var backoff time.Duration
 	for t.Running() {
 		conn, err := listener.Accept()
 		if err != nil {
-			clog.Errorf("Failed to accept TCP connection: %s", err.Error())
+			if errors.Is(err, net.ErrClosed) || !t.Running() {
+				return
+			}
+			// Back off on transient errors (e.g. EMFILE) instead of spinning.
+			if backoff == 0 {
+				backoff = 5 * time.Millisecond
+			} else if backoff < time.Second {
+				backoff *= 2
+			}
+			clog.Errorf("Failed to accept TCP connection: %s. retry in %v", err.Error(), backoff)
+			time.Sleep(backoff)
 			continue
 		}
+		backoff = 0
 
 		t.InChan(conn)
 	}
