@@ -149,6 +149,33 @@ func TestComponentMaster_NodeID2Bytes_Bytes2NodeID_Roundtrip(t *testing.T) {
 	}
 }
 
+func TestRemoveNoticeKeepsNewerRegistration(t *testing.T) {
+	m := newTestMaster("master-1", "master-1")
+	payload, err := m.remove2Bytes("bl-billiard-1", 1791339638399)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeID, lastAt, err := m.bytes2Remove(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nodeID != "bl-billiard-1" || lastAt != 1791339638399 {
+		t.Fatalf("notice = %s %d", nodeID, lastAt)
+	}
+
+	fresh := &cproto.Member{NodeID: nodeID, LastAt: 1791339641429}
+	if !removeIsStale(fresh, lastAt) {
+		t.Fatal("newer LastAt must ignore the timed-out remove")
+	}
+	same := &cproto.Member{NodeID: nodeID, LastAt: lastAt}
+	if removeIsStale(same, lastAt) {
+		t.Fatal("remove for the same LastAt must apply")
+	}
+	if removeIsStale(fresh, 0) {
+		t.Fatal("shutdown remove without LastAt must apply")
+	}
+}
+
 // TestComponentMaster_Bytes2NodeID_InvalidData verifies that deserializing garbage
 // returns an error.
 func TestComponentMaster_Bytes2NodeID_InvalidData(t *testing.T) {
@@ -228,8 +255,8 @@ func TestComponentMaster_CheckMemberTimeout_ActiveKept(t *testing.T) {
 	// Member with recent heartbeat
 	m.memberMap.Store("worker-1", &cproto.Member{
 		NodeID:           "worker-1",
-		LastAt:           now,   // just now
-		HeartbeatTimeout: 3000,  // 3 second timeout
+		LastAt:           now,  // just now
+		HeartbeatTimeout: 3000, // 3 second timeout
 	})
 
 	m.checkMemberTimeout()
@@ -246,7 +273,7 @@ func TestComponentMaster_CheckMemberTimeout_SelfSkipped(t *testing.T) {
 	m := newTestMaster("master-1", "master-1")
 	m.thisMember = &cproto.Member{
 		NodeID:           "master-1",
-		LastAt:           0,    // ancient — would normally be timeout
+		LastAt:           0, // ancient — would normally be timeout
 		HeartbeatTimeout: 3000,
 	}
 	m.memberMap.Store("master-1", m.thisMember)

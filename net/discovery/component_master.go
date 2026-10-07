@@ -87,7 +87,7 @@ func (m *ComponentMaster) UpdateSettings(setting map[string]string) {
 // then the lifecycle context is cancelled to stop all background loops.
 func (m *ComponentMaster) Stop() {
 	if m.isClient() {
-		m.sendRemove(m.thisMember.NodeID)
+		m.sendRemove(m.thisMember.NodeID, 0)
 	}
 
 	if m.cancel != nil {
@@ -365,8 +365,11 @@ func (m *ComponentMaster) sendUpdateMember() {
 }
 
 // sendRemove publishes a remove notification to the master/peers for the given nodeID.
-func (m *ComponentMaster) sendRemove(nodeID string) {
-	nodeBytes, err := m.NodeID2Bytes(nodeID)
+// lastAt is the heartbeat time of the member being removed. Receivers ignore the
+// message when they already hold a newer registration. lastAt 0 removes unconditionally
+// (graceful shutdown, or an older peer that only sent the node id).
+func (m *ComponentMaster) sendRemove(nodeID string, lastAt int64) {
+	nodeBytes, err := m.remove2Bytes(nodeID, lastAt)
 	if err != nil {
 		clog.Warnf("[sendRemove] NodeID2Bytes error. err = %s", err)
 		return
@@ -413,8 +416,11 @@ func (m *ComponentMaster) checkMemberTimeout() {
 		}
 
 		if protoMember.IsTimeout(now) {
+			// Carry the LastAt that just expired. A node that re-registers in the
+			// gap gets a newer LastAt, and this remove must not delete that one.
+			lastAt := protoMember.LastAt
 			m.RemoveMember(protoMember.NodeID)
-			m.sendRemove(protoMember.NodeID)
+			m.sendRemove(protoMember.NodeID, lastAt)
 		}
 
 		return true
@@ -507,7 +513,7 @@ func (m *ComponentMaster) sendAdd(member *cproto.Member) {
 // Both master and workers ignore self-remove to prevent accidental self-deletion.
 func (m *ComponentMaster) removeSubscribe() {
 	err := m.subscribeConnect.Subscribe(m.removeSubject, func(msg *nats.Msg) {
-		nodeID, err := m.bytes2NodeID(msg.Data)
+		nodeID, lastAt, err := m.bytes2Remove(msg.Data)
 		if err != nil {
 			clog.Warnf("[removeSubscribe] bytes to NodeID error. err = %s", err)
 			return
@@ -515,6 +521,14 @@ func (m *ComponentMaster) removeSubscribe() {
 
 		// Never remove self via this path — applies to both master and workers
 		if nodeID == m.App().NodeID() {
+			return
+		}
+
+		// Master publishes this remove and also subscribes to it, so the message
+		// comes back. A node that re-registered in that gap has a newer LastAt
+		// and must stay; applying the echo would drop a live member.
+		if current, ok := m.GetMember(nodeID); ok && removeIsStale(current, lastAt) {
+			clog.Debugf("ignore stale remove. [nodeID = %s, removeLastAt = %d]", nodeID, lastAt)
 			return
 		}
 
@@ -593,6 +607,33 @@ func (m *ComponentMaster) bytes2NodeID(data []byte) (string, error) {
 	return nodeIDProto.Value, nil
 }
 
+// remove2Bytes encodes a remove notice. Field 1 is the node id, so an older
+// peer that only unmarshals NodeID still sees the id. lastAt is Member.lastAt.
+func (m *ComponentMaster) remove2Bytes(nodeID string, lastAt int64) ([]byte, error) {
+	return m.App().Serializer().Marshal(&cproto.Member{NodeID: nodeID, LastAt: lastAt})
+}
+
+func (m *ComponentMaster) bytes2Remove(data []byte) (string, int64, error) {
+	member := &cproto.Member{}
+	if err := m.App().Serializer().Unmarshal(data, member); err != nil {
+		return "", 0, err
+	}
+	return member.NodeID, member.LastAt, nil
+}
+
+// removeIsStale reports whether a remove notice is older than the member we hold.
+// lastAt 0 is an unconditional remove (shutdown, or a peer that did not send a time).
+func removeIsStale(current cfacade.IMember, removeLastAt int64) bool {
+	if removeLastAt <= 0 || current == nil {
+		return false
+	}
+	member, ok := current.(*cproto.Member)
+	if !ok {
+		return false
+	}
+	return member.GetLastAt() > removeLastAt
+}
+
 // OnBeforeStop tells the cluster this worker is leaving, so peers stop routing
 // to it now instead of after the heartbeat timeout. The ticker is cancelled
 // first so a late heartbeat cannot re-register the node.
@@ -601,7 +642,7 @@ func (m *ComponentMaster) OnBeforeStop() {
 		m.cancel()
 	}
 	if m.isClient() && m.publishConnect != nil && m.thisMember != nil {
-		m.sendRemove(m.thisMember.NodeID)
+		m.sendRemove(m.thisMember.NodeID, 0)
 	}
 }
 
