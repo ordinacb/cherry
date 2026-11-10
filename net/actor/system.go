@@ -305,7 +305,9 @@ func (p *System) CallWait(source, target, funcName string, arg, reply any) int32
 		message.Target = target
 		message.FuncName = funcName
 		message.Args = arg
-		message.ChanResult = make(chan interface{}, 1) // Buffered (1)
+		// 接收方可能立即回收 message；等待方只读取投递前保存的通道。
+		resultChan := make(chan interface{}, 1)
+		message.ChanResult = resultChan
 
 		if sourcePath.ActorID == targetPath.ActorID {
 			childActor, found := p.GetChildActor(targetPath.ActorID, targetPath.ChildID)
@@ -324,7 +326,7 @@ func (p *System) CallWait(source, target, funcName string, arg, reply any) int32
 		var result interface{}
 
 		select {
-		case result = <-message.ChanResult:
+		case result = <-resultChan:
 			{
 				if result == nil {
 					clog.Warnf("[CallWait] Response is nil. [source = %s, target = %s, funcName = %s]",

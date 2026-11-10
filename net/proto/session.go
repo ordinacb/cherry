@@ -1,33 +1,9 @@
 package cherryProto
 
 import (
-	"sync"
-
 	cconst "github.com/cherry-game/cherry/const"
 	cstring "github.com/cherry-game/cherry/extend/string"
 )
-
-const (
-	MIDKey = "mid"
-)
-
-// sessionMu guards every access to Session.Data.
-//
-// A session is shared by two goroutines by design. The agent's read loop
-// stamps the message id onto it before dispatching each request, while the
-// backend actors that request reaches write their own keys into it — a bound
-// uid, a table id, the node holding the player. Neither side knows about the
-// other, and the map underneath had no protection, so a request arriving while
-// an actor was writing crashed the whole process with "concurrent map writes".
-// It needs the two to overlap within the same microsecond, which is why it
-// only showed up once a login grew slow enough to still be finishing when the
-// client's next request landed.
-//
-// One lock for all sessions rather than one per session, because Session is a
-// generated protobuf type with no room for a mutex field, and because the
-// critical sections are single map operations. Contention is a map lookup
-// wide; the alternative is a process-wide crash.
-var sessionMu sync.RWMutex
 
 func (x *Session) IsBind() bool {
 	return x.Uid > 0
@@ -38,13 +14,12 @@ func (x *Session) ActorPath() string {
 }
 
 func (x *Session) Add(key string, value interface{}) {
-	x.Set(key, cstring.ToString(value))
+	x.ensureData()
+
+	x.Data[key] = cstring.ToString(value)
 }
 
 func (x *Session) Remove(key string) {
-	sessionMu.Lock()
-	defer sessionMu.Unlock()
-
 	delete(x.Data, key)
 }
 
@@ -53,50 +28,49 @@ func (x *Session) Set(key string, value string) {
 		return
 	}
 
-	sessionMu.Lock()
-	defer sessionMu.Unlock()
-
-	x.set(key, value)
-}
-
-// set writes without locking, for callers already holding the lock.
-func (x *Session) set(key string, value string) {
-	if key == "" || value == "" {
-		return
-	}
+	x.ensureData()
 
 	x.Data[key] = value
 }
 
-func (x *Session) SetMID(mid uint32) {
-	x.Add(MIDKey, mid)
+// ensureData lazily allocates the data map before a write.
+//
+// A session that crossed the cluster arrives with a nil Data map whenever the
+// sender had nothing to send, because proto3 does not serialize an empty map.
+// Remote handlers do write session data, so allocate on demand rather than
+// panicking with "assignment to entry in nil map".
+func (x *Session) ensureData() {
+	if x.Data == nil {
+		x.Data = map[string]string{}
+	}
 }
 
+// SetMID sets the message id of the message currently being routed.
+//
+// mid is per message, not session state: only write it on the per-message
+// session copy built for a single incoming packet. Writing it on a session
+// shared with another goroutine is a data race.
+func (x *Session) SetMID(mid uint32) {
+	x.Mid = mid
+}
+
+// GetMID returns the message id of the message currently being routed.
 func (x *Session) GetMID() uint32 {
-	return uint32(x.GetUint(MIDKey))
+	return x.Mid
 }
 
 func (x *Session) ImportAll(data map[string]string) {
-	sessionMu.Lock()
-	defer sessionMu.Unlock()
-
 	for k, v := range data {
-		x.set(k, v)
+		x.Set(k, v)
 	}
 }
 
 func (x *Session) Contains(key string) bool {
-	sessionMu.RLock()
-	defer sessionMu.RUnlock()
-
 	_, found := x.Data[key]
 	return found
 }
 
 func (x *Session) Equal(key, value string) bool {
-	sessionMu.RLock()
-	defer sessionMu.RUnlock()
-
 	dataValue, found := x.Data[key]
 	if !found {
 		return false
@@ -106,41 +80,22 @@ func (x *Session) Equal(key, value string) bool {
 }
 
 func (x *Session) Restore(data map[string]string) {
-	sessionMu.Lock()
-	defer sessionMu.Unlock()
-
-	// Clearing and refilling under one lock, so that no reader can observe the
-	// session empty part-way through a restore.
-	for k := range x.Data {
-		delete(x.Data, k)
-	}
+	x.Clear()
 
 	for k, v := range data {
-		x.set(k, v)
+		x.Set(k, v)
 	}
 }
 
 // Clear releases all settings related to current sc
 func (x *Session) Clear() {
-	sessionMu.Lock()
-	defer sessionMu.Unlock()
-
 	for k := range x.Data {
 		delete(x.Data, k)
 	}
 }
 
-// get reads under the shared lock.
-func (x *Session) get(key string) (string, bool) {
-	sessionMu.RLock()
-	defer sessionMu.RUnlock()
-
-	v, ok := x.Data[key]
-	return v, ok
-}
-
 func (x *Session) GetUint(key string) uint {
-	v, ok := x.get(key)
+	v, ok := x.Data[key]
 	if !ok {
 		return 0
 	}
@@ -153,7 +108,7 @@ func (x *Session) GetUint(key string) uint {
 }
 
 func (x *Session) GetInt(key string) int {
-	v, ok := x.get(key)
+	v, ok := x.Data[key]
 	if !ok {
 		return 0
 	}
@@ -167,7 +122,7 @@ func (x *Session) GetInt(key string) int {
 
 // GetInt32 returns the value associated with the key as a int32.
 func (x *Session) GetInt32(key string) int32 {
-	v, ok := x.get(key)
+	v, ok := x.Data[key]
 	if !ok {
 		return 0
 	}
@@ -180,7 +135,7 @@ func (x *Session) GetInt32(key string) int32 {
 }
 
 func (x *Session) GetInt64(key string) int64 {
-	v, ok := x.get(key)
+	v, ok := x.Data[key]
 	if !ok {
 		return 0
 	}
@@ -194,6 +149,10 @@ func (x *Session) GetInt64(key string) int64 {
 
 // GetString returns the value associated with the key as a string.
 func (x *Session) GetString(key string) string {
-	v, _ := x.get(key)
+	v, ok := x.Data[key]
+	if !ok {
+		return ""
+	}
+
 	return v
 }
