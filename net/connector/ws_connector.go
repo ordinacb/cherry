@@ -24,7 +24,7 @@ type (
 	// interface base on *websocket.INetConn
 	WSConn struct {
 		*websocket.Conn
-		typ      int    // message type
+		typ      int // message type
 		reader   io.Reader
 		remoteIP string // 从header提取的真实客户端IP，优先于底层连接的RemoteAddr
 	}
@@ -75,6 +75,9 @@ func NewWS(address string, opts ...Option) *WSConnector {
 func (w *WSConnector) Start() {
 	listener, err := w.GetListener(w.certFile, w.keyFile, w.address)
 	if err != nil {
+		if !w.Running() {
+			return
+		}
 		clog.Fatalf("failed to listen: %s", err)
 	}
 

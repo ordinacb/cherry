@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"fmt"
 	"hash/crc32"
+	"reflect"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -33,7 +35,11 @@ func TestNewNode(t *testing.T) {
 		t.Fatalf("error creating NewNode, %s", err)
 	}
 
-	_, err = NewNode(5000)
+	maximum := int64(-1 ^ (-1 << NodeBits))
+	if _, err := NewNode(maximum); err != nil {
+		t.Fatalf("maximum valid node rejected: %v", err)
+	}
+	_, err = NewNode(maximum + 1)
 	if err == nil {
 		t.Fatalf("no error creating NewNode, %s", err)
 	}
@@ -61,8 +67,11 @@ func TestRace(t *testing.T) {
 
 	node, _ := NewNode(1)
 
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
-		for i := 0; i < 1000000000; i++ {
+		defer wg.Done()
+		for i := 0; i < 4000; i++ {
 			NewNode(1)
 		}
 	}()
@@ -71,7 +80,60 @@ func TestRace(t *testing.T) {
 
 		node.Generate()
 	}
+	wg.Wait()
 
+}
+
+func TestConcurrentCreationAndIDInspection(t *testing.T) {
+	node, err := NewNode(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 4000; i++ {
+			_, _ = NewNode(2)
+		}
+	}()
+	for i := 0; i < 4000; i++ {
+		id := node.Generate()
+		if id.Node() != 1 || id.Time() <= Epoch {
+			t.Error("ID inspection lost its configuration")
+		}
+		_ = id.Step()
+	}
+	wg.Wait()
+}
+
+func TestConcurrentDefaultInitialization(t *testing.T) {
+	defaultNodeMu.Lock()
+	previous := defaultNode
+	defaultNode = nil
+	defaultNodeMu.Unlock()
+	defer func() { defaultNodeMu.Lock(); defaultNode = previous; defaultNodeMu.Unlock() }()
+	ids := make(chan ID, 800)
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			SetDefaultNode(1)
+			for j := 0; j < 100; j++ {
+				ids <- Next()
+			}
+		}()
+	}
+	wg.Wait()
+	close(ids)
+	seen := map[ID]bool{}
+	for id := range ids {
+		if seen[id] {
+			t.Fatalf("multiple default generators emitted duplicate ID: %d", id)
+		}
+		seen[id] = true
+	}
 }
 
 func TestAtomicInt64(t *testing.T) {
@@ -392,14 +454,14 @@ func TestUnmarshalJSON(t *testing.T) {
 	}{
 		{`"13587"`, 13587, nil},
 		{`1`, 0, JSONSyntaxError{[]byte("1")}},
-		{`"invalid`, 0, JSONSyntaxError{[]byte("invalid")}},
+		{`"invalid`, 0, JSONSyntaxError{[]byte(`"invalid`)}},
 	}
 
 	for _, tc := range tt {
 		var id ID
 		err := id.UnmarshalJSON([]byte(tc.json))
 
-		if err != tc.expectedErr {
+		if !reflect.DeepEqual(err, tc.expectedErr) {
 			t.Fatalf("Expected to get error '%s' decoding JSON, but got '%s'", tc.expectedErr, err)
 		}
 

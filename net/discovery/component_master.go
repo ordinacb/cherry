@@ -249,6 +249,7 @@ func (m *ComponentMaster) addSubscribe() {
 func (m *ComponentMaster) clientTicker() {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+	registered := false
 
 	for {
 		select {
@@ -260,6 +261,15 @@ func (m *ComponentMaster) clientTicker() {
 				clog.Info("[clientTicker] Waiting for the application to change its running state.")
 				continue
 			}
+			// A known node ID may belong to the previous process. Heartbeat success
+			// does not mean this fresh worker has fetched its initial member table.
+			if !registered {
+				registered = m.sendRegister2Master(false)
+				if registered {
+					m.reconcileAt = time.Now().Add(2*time.Duration(m.thisMember.HeartbeatTimeout)*time.Millisecond + time.Second)
+				}
+				continue
+			}
 
 			// Heartbeat first; if master replies with registerRequired marker,
 			// send a full registration to sync the member list.
@@ -267,7 +277,7 @@ func (m *ComponentMaster) clientTicker() {
 				if m.ctx.Err() != nil {
 					return
 				}
-				m.sendRegister2Master(false)
+				registered = m.sendRegister2Master(false)
 				// The master just (re)started and only knows the nodes that have
 				// re-registered so far. Give the rest a few heartbeats to come
 				// back, then drop whatever the master still does not know.
@@ -276,17 +286,18 @@ func (m *ComponentMaster) clientTicker() {
 			}
 
 			if !m.reconcileAt.IsZero() && time.Now().After(m.reconcileAt) {
-				m.reconcileAt = time.Time{}
-				m.sendRegister2Master(true)
+				if m.sendRegister2Master(true) {
+					m.reconcileAt = time.Time{}
+				}
 			}
 		}
 	}
 }
 
 // sendHeartbeat2Master sends a heartbeat request to the master.
-// Returns true if the master replied (meaning this node is known),
-// or true if the reply contains registerRequired (unknown node, re-register needed).
-// Returns false on error (master unreachable).
+// Returns true only for registerRequired (unknown node, re-register needed).
+// False means either a known node or an unreachable master; cold registration
+// is tracked independently by clientTicker.
 func (m *ComponentMaster) sendHeartbeat2Master() bool {
 	nodeIDBytes, err := m.NodeID2Bytes(m.thisMember.NodeID)
 	if err != nil {
@@ -308,27 +319,39 @@ func (m *ComponentMaster) sendHeartbeat2Master() bool {
 // the member list reply, adding any members not yet known locally.
 // With prune, local members absent from the master's list are removed; this
 // clears nodes that died while the master was down and never came back.
-func (m *ComponentMaster) sendRegister2Master(prune bool) {
+func (m *ComponentMaster) sendRegister2Master(prune bool) bool {
 	memberBytes, err := m.member2Bytes(m.localMemberSnapshot())
 	if err != nil {
 		clog.Warnf("[sendRegister2Master] member marshal error. err = %s", err)
-		return
+		return false
 	}
 
 	reqID := cnats.NewStringReqID()
 	rspData, err := m.publishConnect.RequestSync(reqID, m.registerSubject, memberBytes)
 	if err != nil {
 		clog.Warnf("[sendRegister2Master] Fail. master = %s, err = %s", m.masterID, err)
-		return
+		return false
 	}
-
-	clog.Infof("[sendRegister2Master] OK. master = %s", m.masterID)
 
 	memberList, err := m.bytes2MemberList(rspData)
 	if err != nil {
 		clog.Warnf("[sendRegister2Master] Rsp data error. err = %s", err)
-		return
+		return false
 	}
+	// The registration reply must contain this worker, which the master adds
+	// before replying. An empty valid protobuf is not a completed registration.
+	containsSelf := false
+	for _, member := range memberList.GetList() {
+		if member.GetNodeID() == m.thisMember.NodeID {
+			containsSelf = true
+			break
+		}
+	}
+	if !containsSelf {
+		clog.Warnf("[sendRegister2Master] member list omits local node. node = %s", m.thisMember.NodeID)
+		return false
+	}
+	clog.Infof("[sendRegister2Master] OK. master = %s", m.masterID)
 
 	known := make(map[string]struct{}, len(memberList.GetList()))
 	for _, member := range memberList.GetList() {
@@ -345,6 +368,7 @@ func (m *ComponentMaster) sendRegister2Master(prune bool) {
 	if prune {
 		m.pruneMembers(known)
 	}
+	return true
 }
 
 // pruneMembers removes local members (other than self) not present in known.

@@ -3,41 +3,55 @@ package cherrySnowflake
 import (
 	ccrypto "github.com/cherry-game/cherry/extend/crypto"
 	clog "github.com/cherry-game/cherry/logger"
+	"sync"
 )
 
 var (
-	defaultNode *Node
+	defaultNode   *Node
+	defaultNodeMu sync.RWMutex
 )
 
 func InitDefaultNode(str string) {
+	mu.Lock()
+	maximum := nodeMax
+	mu.Unlock()
 	var (
 		crc32Value = int64(ccrypto.CRC32(str))
-		nodeValue  = crc32Value % nodeMax
+		nodeValue  = crc32Value % maximum
 	)
 
 	SetDefaultNode(nodeValue)
 }
 
 func SetDefaultNode(nodeValue int64) {
+	defaultNodeMu.Lock()
 	if defaultNode != nil {
+		defaultNodeMu.Unlock()
 		clog.Warn("default snowflake node is created.")
 		return
 	}
 
 	var err error
 	defaultNode, err = NewNode(nodeValue)
+	defaultNodeMu.Unlock()
 	if err != nil {
 		clog.Warn(err)
 		clog.Warnf("create default snowflake node fail. nodeValue = %d", nodeValue)
 	}
 
-	clog.Infof("[snowflake] nodeValue = %d, nodeMax = %d", nodeValue, nodeMax)
+	mu.Lock()
+	maximum := nodeMax
+	mu.Unlock()
+	clog.Infof("[snowflake] nodeValue = %d, nodeMax = %d", nodeValue, maximum)
 }
 
 func Next() ID {
-	return defaultNode.Generate()
+	defaultNodeMu.RLock()
+	node := defaultNode
+	defaultNodeMu.RUnlock()
+	return node.Generate()
 }
 
 func NextID() int64 {
-	return defaultNode.Generate().Int64()
+	return Next().Int64()
 }

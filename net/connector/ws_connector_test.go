@@ -9,10 +9,9 @@ import (
 )
 
 func TestNewWSConnector(t *testing.T) {
-	addr := freeAddr(t)
 	received := make(chan []byte, 1)
 
-	ws := NewWS(addr)
+	ws := NewWS("127.0.0.1:0")
 	ws.OnConnect(func(conn net.Conn) {
 		go func() {
 			defer conn.Close()
@@ -30,6 +29,7 @@ func TestNewWSConnector(t *testing.T) {
 		ws.Start()
 		close(done)
 	}()
+	addr := boundAddr(t, &ws.Connector)
 
 	var client *websocket.Conn
 	var err error

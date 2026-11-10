@@ -55,6 +55,9 @@ func NewTCP(address string, opts ...Option) *TCPConnector {
 func (t *TCPConnector) Start() {
 	listener, err := t.GetListener(t.certFile, t.keyFile, t.address)
 	if err != nil {
+		if errors.Is(err, net.ErrClosed) && !t.Running() {
+			return
+		}
 		clog.Fatalf("failed to listen: %s", err)
 	}
 
