@@ -70,17 +70,36 @@ func (m *ComponentMaster) Init() {
 
 // UpdateSetting updates a single setting on this member and broadcasts the change.
 func (m *ComponentMaster) UpdateSetting(key, value string) {
-	m.thisMember.UpdateSetting(key, value)
-	m.sendUpdateMember()
+	m.UpdateSettings(map[string]string{key: value})
 }
 
 // UpdateSettings updates multiple settings on this member and broadcasts the change.
 func (m *ComponentMaster) UpdateSettings(setting map[string]string) {
-	for key, value := range setting {
-		m.thisMember.UpdateSetting(key, value)
+	m.memberMu.Lock()
+	if m.thisMember.Settings == nil {
+		m.thisMember.Settings = make(map[string]string)
 	}
-
+	m.thisMember.UpdateSettings(setting)
+	var published *cproto.Member
+	if value, found := m.memberMap.Load(m.thisMember.NodeID); found {
+		published = snapshotMember(value.(cfacade.IMember))
+		if published.Settings == nil {
+			published.Settings = make(map[string]string)
+		}
+		published.UpdateSettings(setting)
+		m.memberMap.Store(published.NodeID, published)
+	}
+	m.memberMu.Unlock()
+	if published != nil {
+		m.notify(&m.onUpdateListener, published)
+	}
 	m.sendUpdateMember()
+}
+
+func (m *ComponentMaster) localMemberSnapshot() *cproto.Member {
+	m.memberMu.RLock()
+	defer m.memberMu.RUnlock()
+	return snapshotMember(m.thisMember)
 }
 
 // Stop performs a graceful shutdown: workers send a remove message,
@@ -290,7 +309,7 @@ func (m *ComponentMaster) sendHeartbeat2Master() bool {
 // With prune, local members absent from the master's list are removed; this
 // clears nodes that died while the master was down and never came back.
 func (m *ComponentMaster) sendRegister2Master(prune bool) {
-	memberBytes, err := m.member2Bytes(m.thisMember)
+	memberBytes, err := m.member2Bytes(m.localMemberSnapshot())
 	if err != nil {
 		clog.Warnf("[sendRegister2Master] member marshal error. err = %s", err)
 		return
@@ -351,7 +370,7 @@ func (m *ComponentMaster) pruneMembers(known map[string]struct{}) {
 // sendUpdateMember broadcasts updated member info (typically settings changes)
 // to all nodes via the update subject.
 func (m *ComponentMaster) sendUpdateMember() {
-	memberBytes, err := m.member2Bytes(m.thisMember)
+	memberBytes, err := m.member2Bytes(m.localMemberSnapshot())
 	if err != nil {
 		clog.Warnf("[UpdateMember] member marshal error. err = %s", err)
 		return
@@ -404,27 +423,21 @@ func (m *ComponentMaster) heartbeatCheck() {
 // The local node (thisMember) is never evicted.
 func (m *ComponentMaster) checkMemberTimeout() {
 	now := ctime.Now().ToMillisecond()
-	m.memberMap.Range(func(key, value any) bool {
-		protoMember, ok := value.(*cproto.Member)
-		if !ok {
-			clog.Warnf("[checkMemberTimeout] Member type error. Member = %v", value)
-			return true
-		}
-
+	for _, value := range m.Map() {
+		protoMember := value.(*cproto.Member)
 		if protoMember.NodeID == m.thisMember.GetNodeID() {
-			return true
+			continue
 		}
 
 		if protoMember.IsTimeout(now) {
 			// Carry the LastAt that just expired. A node that re-registers in the
 			// gap gets a newer LastAt, and this remove must not delete that one.
 			lastAt := protoMember.LastAt
-			m.RemoveMember(protoMember.NodeID)
-			m.sendRemove(protoMember.NodeID, lastAt)
+			if m.removeMemberAt(protoMember.NodeID, lastAt) {
+				m.sendRemove(protoMember.NodeID, lastAt)
+			}
 		}
-
-		return true
-	})
+	}
 }
 
 // registerSubscribe handles incoming register requests on the master.
@@ -463,11 +476,7 @@ func (m *ComponentMaster) heartbeatSubscribe() {
 
 		reqID := msg.Header.Get(cnats.REQ_ID)
 
-		if value, found := m.GetMember(nodeID); found {
-			// Known node: refresh heartbeat timestamp
-			if protoMember, ok := value.(*cproto.Member); ok {
-				protoMember.LastAt = ctime.Now().ToMillisecond()
-			}
+		if m.refreshHeartbeat(nodeID, ctime.Now().ToMillisecond()) {
 			m.publishConnect.RequestReply(reqID, msg.Reply, nil)
 		} else {
 			// Unknown node: signal it to send a full registration
@@ -477,6 +486,21 @@ func (m *ComponentMaster) heartbeatSubscribe() {
 	if err != nil {
 		clog.Warnf("[heartbeatSubscribe] fail. subject = %s, err = %s", m.heartbeatSubject, err)
 	}
+}
+
+// refreshHeartbeat replaces the internal immutable record; wire replies and IMember
+// snapshots can therefore be serialized without sharing the heartbeat's mutable state.
+func (m *ComponentMaster) refreshHeartbeat(nodeID string, now int64) bool {
+	m.memberMu.Lock()
+	defer m.memberMu.Unlock()
+	value, found := m.memberMap.Load(nodeID)
+	if !found {
+		return false
+	}
+	member := snapshotMember(value.(cfacade.IMember))
+	member.LastAt = now
+	m.memberMap.Store(nodeID, member)
+	return true
 }
 
 // replyMemberList sends the full member list back to a requesting node
@@ -527,12 +551,7 @@ func (m *ComponentMaster) removeSubscribe() {
 		// Master publishes this remove and also subscribes to it, so the message
 		// comes back. A node that re-registered in that gap has a newer LastAt
 		// and must stay; applying the echo would drop a live member.
-		if current, ok := m.GetMember(nodeID); ok && removeIsStale(current, lastAt) {
-			clog.Debugf("ignore stale remove. [nodeID = %s, removeLastAt = %d]", nodeID, lastAt)
-			return
-		}
-
-		m.ComponentDefault.RemoveMember(nodeID)
+		m.removeMemberAt(nodeID, lastAt)
 	})
 	if err != nil {
 		clog.Warnf("[removeSubscribe] fail. subject = %s, err = %s", m.removeSubject, err)
@@ -578,10 +597,9 @@ func (m *ComponentMaster) bytes2Member(data []byte) (*cproto.Member, error) {
 // memberList2Bytes builds a MemberList proto from the current memberMap and serializes it.
 func (m *ComponentMaster) memberList2Bytes() ([]byte, error) {
 	memberList := &cproto.MemberList{}
-	m.memberMap.Range(func(key, value any) bool {
+	for _, value := range m.Map() {
 		memberList.List = append(memberList.List, value.(*cproto.Member))
-		return true
-	})
+	}
 	return m.App().Serializer().Marshal(memberList)
 }
 

@@ -293,8 +293,8 @@ func (p *Actor) onStop() {
 		p.handler.OnStop()
 		p.timer.onStop()
 		p.event.onStop()
-		p.localMail.onStop()
-		p.remoteMail.onStop()
+		p.localMail.onStop(p.App())
+		p.remoteMail.onStop(p.App())
 	}, func(errString string) {
 		clog.Error(errString)
 	})
@@ -381,12 +381,18 @@ func (p *Actor) Timer() ITimer {
 
 func (p *Actor) PostRemote(m *cfacade.Message) {
 	m.AddRef()
-	p.remoteMail.Push(m)
+	if !p.remoteMail.Push(m) {
+		notifyDrop(p.App(), m, DropActorNotReady)
+		m.Recycle()
+	}
 }
 
 func (p *Actor) PostLocal(m *cfacade.Message) {
 	m.AddRef()
-	p.localMail.Push(m)
+	if !p.localMail.Push(m) {
+		notifyDrop(p.App(), m, DropActorNotReady)
+		m.Recycle()
+	}
 }
 
 func (p *Actor) PostEvent(data cfacade.IEventData) {

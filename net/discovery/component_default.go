@@ -10,6 +10,7 @@ import (
 	clog "github.com/cherry-game/cherry/logger"
 	cproto "github.com/cherry-game/cherry/net/proto"
 	cprofile "github.com/cherry-game/cherry/profile"
+	"google.golang.org/protobuf/proto"
 )
 
 // Config keys used to parse node information from the profile file.
@@ -33,6 +34,8 @@ const (
 // embed ComponentDefault to reuse the member storage and listener notification logic.
 type ComponentDefault struct {
 	cfacade.Component
+	memberMu         sync.RWMutex             // protects member contents and conditional mutations
+	listenerMu       sync.RWMutex             // protects registration; callbacks run without this lock
 	memberMap        sync.Map                 // key:nodeID, value:cfacade.IMember
 	onAddListener    []cfacade.MemberListener // listeners for member add events
 	onUpdateListener []cfacade.MemberListener // listeners for member update events
@@ -91,7 +94,9 @@ func (n *ComponentDefault) loadConfig() {
 				member.Settings[key] = settings.Get(key).ToString()
 			}
 
+			n.memberMu.Lock()
 			n.memberMap.Store(member.NodeID, member)
+			n.memberMu.Unlock()
 		}
 	}
 }
@@ -99,10 +104,12 @@ func (n *ComponentDefault) loadConfig() {
 // Map returns a snapshot of all known members as a plain map.
 func (n *ComponentDefault) Map() map[string]cfacade.IMember {
 	memberMap := map[string]cfacade.IMember{}
+	n.memberMu.RLock()
+	defer n.memberMu.RUnlock()
 
 	n.memberMap.Range(func(key, value any) bool {
 		if member, ok := value.(cfacade.IMember); ok {
-			memberMap[member.GetNodeID()] = member
+			memberMap[member.GetNodeID()] = snapshotMember(member)
 		}
 		return true
 	})
@@ -113,12 +120,14 @@ func (n *ComponentDefault) Map() map[string]cfacade.IMember {
 // ListByType returns members of the given nodeType, excluding any nodes listed in filterNodeID.
 func (n *ComponentDefault) ListByType(nodeType string, filterNodeID ...string) []cfacade.IMember {
 	var memberList []cfacade.IMember
+	n.memberMu.RLock()
+	defer n.memberMu.RUnlock()
 
 	n.memberMap.Range(func(key, value any) bool {
 		member := value.(cfacade.IMember)
 		if member.GetNodeType() == nodeType {
 			if _, ok := cslice.StringIn(member.GetNodeID(), filterNodeID); !ok {
-				memberList = append(memberList, member)
+				memberList = append(memberList, snapshotMember(member))
 			}
 		}
 
@@ -160,12 +169,14 @@ func (n *ComponentDefault) GetMember(nodeID string) (cfacade.IMember, bool) {
 		return nil, false
 	}
 
+	n.memberMu.RLock()
+	defer n.memberMu.RUnlock()
 	value, found := n.memberMap.Load(nodeID)
 	if !found {
 		return nil, false
 	}
 
-	return value.(cfacade.IMember), found
+	return snapshotMember(value.(cfacade.IMember)), found
 }
 
 // UpdateSetting updates a single setting on the local node's member entry
@@ -175,30 +186,7 @@ func (n *ComponentDefault) GetMember(nodeID string) (cfacade.IMember, bool) {
 // Backends with a transport layer (nats, etcd) override this method to also
 // broadcast the change to other nodes.
 func (n *ComponentDefault) UpdateSetting(key, value string) {
-	if n.App() == nil {
-		return
-	}
-
-	nodeID := n.App().NodeID()
-	if nodeID == "" {
-		return
-	}
-
-	raw, found := n.memberMap.Load(nodeID)
-	if !found {
-		return
-	}
-
-	member, ok := raw.(*cproto.Member)
-	if !ok {
-		return
-	}
-
-	member.UpdateSetting(key, value)
-
-	for _, listener := range n.onUpdateListener {
-		listener(member)
-	}
+	n.UpdateSettings(map[string]string{key: value})
 }
 
 // UpdateSettings updates multiple settings on the local node's member entry
@@ -217,21 +205,27 @@ func (n *ComponentDefault) UpdateSettings(settings map[string]string) {
 		return
 	}
 
+	n.memberMu.Lock()
 	raw, found := n.memberMap.Load(nodeID)
 	if !found {
+		n.memberMu.Unlock()
 		return
 	}
 
 	member, ok := raw.(*cproto.Member)
 	if !ok {
+		n.memberMu.Unlock()
 		return
 	}
+	member = snapshotMember(member)
 
-	member.UpdateSettings(settings)
-
-	for _, listener := range n.onUpdateListener {
-		listener(member)
+	if member.Settings == nil {
+		member.Settings = make(map[string]string)
 	}
+	member.UpdateSettings(settings)
+	n.memberMap.Store(nodeID, member)
+	n.memberMu.Unlock()
+	n.notify(&n.onUpdateListener, member)
 }
 
 // OnAddMember registers a listener that is called after a member is added via AddMember().
@@ -240,7 +234,9 @@ func (n *ComponentDefault) OnAddMember(listener cfacade.MemberListener) {
 	if listener == nil {
 		return
 	}
+	n.listenerMu.Lock()
 	n.onAddListener = append(n.onAddListener, listener)
+	n.listenerMu.Unlock()
 }
 
 // OnUpdateMember registers a listener that is called when an existing member is updated via UpdateMember().
@@ -249,7 +245,9 @@ func (n *ComponentDefault) OnUpdateMember(listener cfacade.MemberListener) {
 	if listener == nil {
 		return
 	}
+	n.listenerMu.Lock()
 	n.onUpdateListener = append(n.onUpdateListener, listener)
+	n.listenerMu.Unlock()
 }
 
 // OnRemoveMember registers a listener that is called after a member is removed via RemoveMember().
@@ -258,7 +256,9 @@ func (n *ComponentDefault) OnRemoveMember(listener cfacade.MemberListener) {
 	if listener == nil {
 		return
 	}
+	n.listenerMu.Lock()
 	n.onRemoveListener = append(n.onRemoveListener, listener)
+	n.listenerMu.Unlock()
 }
 
 // AddMember inserts a member into the local member table and notifies add listeners.
@@ -266,41 +266,73 @@ func (n *ComponentDefault) OnRemoveMember(listener cfacade.MemberListener) {
 // same ID carries a new address/settings, and the map must match what the
 // listeners were given.
 func (n *ComponentDefault) AddMember(member cfacade.IMember) {
+	member = snapshotMember(member)
+	n.memberMu.Lock()
 	_, isDuplicate := n.memberMap.Swap(member.GetNodeID(), member)
+	n.memberMu.Unlock()
 	if isDuplicate {
 		clog.Debugf("Replace Member. [member = %s]", member)
 	} else {
 		clog.Debugf("Add Member. [ member = %s]", member)
 	}
 
-	for _, listener := range n.onAddListener {
-		listener(member)
-	}
+	n.notify(&n.onAddListener, member)
 }
 
 // UpdateMember stores the given member. If one already existed under the
 // same nodeID, onUpdateListener callbacks fire with the new value.
 func (n *ComponentDefault) UpdateMember(member *cproto.Member) {
+	member = snapshotMember(member)
+	n.memberMu.Lock()
 	_, loaded := n.memberMap.Swap(member.NodeID, member)
+	n.memberMu.Unlock()
 	if loaded {
 		clog.Debugf("Update member. [member = %s]", member)
 
-		for _, listener := range n.onUpdateListener {
-			listener(member)
-		}
+		n.notify(&n.onUpdateListener, member)
 	}
 }
 
 // RemoveMember deletes a member from the local member table by nodeID.
 // If the member existed, notifies all onRemoveListener callbacks.
 func (n *ComponentDefault) RemoveMember(nodeID string) {
-	value, loaded := n.memberMap.LoadAndDelete(nodeID)
-	if loaded {
-		member := value.(cfacade.IMember)
-		clog.Debugf("Remove member. [member = %s]", member)
+	n.removeMemberAt(nodeID, 0)
+}
 
-		for _, listener := range n.onRemoveListener {
-			listener(member)
-		}
+// removeMemberAt keeps the timestamp check and deletion atomic with heartbeat/registration.
+// Zero retains the unconditional graceful-shutdown behavior.
+func (n *ComponentDefault) removeMemberAt(nodeID string, lastAt int64) bool {
+	n.memberMu.Lock()
+	value, found := n.memberMap.Load(nodeID)
+	if !found || removeIsStale(value.(cfacade.IMember), lastAt) {
+		n.memberMu.Unlock()
+		return false
+	}
+	n.memberMap.Delete(nodeID)
+	member := snapshotMember(value.(cfacade.IMember))
+	n.memberMu.Unlock()
+	clog.Debugf("Remove member. [member = %s]", member)
+	n.notify(&n.onRemoveListener, member)
+	return true
+}
+
+// snapshotMember never publishes the stored protobuf object or its Settings map.
+func snapshotMember(member cfacade.IMember) *cproto.Member {
+	if p, ok := member.(*cproto.Member); ok {
+		return proto.Clone(p).(*cproto.Member)
+	}
+	p := &cproto.Member{NodeID: member.GetNodeID(), NodeType: member.GetNodeType(), Address: member.GetAddress(), Settings: make(map[string]string)}
+	for key, value := range member.GetSettings() {
+		p.Settings[key] = value
+	}
+	return p
+}
+
+func (n *ComponentDefault) notify(list *[]cfacade.MemberListener, member cfacade.IMember) {
+	n.listenerMu.RLock()
+	listeners := append([]cfacade.MemberListener(nil), (*list)...)
+	n.listenerMu.RUnlock()
+	for _, listener := range listeners {
+		listener(snapshotMember(member))
 	}
 }

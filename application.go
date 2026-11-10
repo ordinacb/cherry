@@ -82,7 +82,7 @@ func (a *Application) NodeMode() NodeMode {
 }
 
 func (a *Application) Running() bool {
-	return a.running > 0
+	return atomic.LoadInt32(&a.running) > 0
 }
 
 func (a *Application) DieChan() chan bool {

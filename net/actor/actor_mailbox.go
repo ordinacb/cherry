@@ -64,16 +64,19 @@ func (p *mailbox) Pop() *cfacade.Message {
 	return msg
 }
 
-func (p *mailbox) Push(m *cfacade.Message) {
-	if m != nil {
-		p.queue.Push(m)
-	}
+func (p *mailbox) Push(m *cfacade.Message) bool {
+	return m != nil && p.queue.Push(m)
 }
 
-func (p *mailbox) onStop() {
+func (p *mailbox) onStop(app cfacade.IApplication) {
 	for key := range p.funcMap {
 		delete(p.funcMap, key)
 	}
 
-	p.queue.Destroy()
+	for _, value := range p.queue.Destroy() {
+		if m, ok := value.(*cfacade.Message); ok {
+			notifyDrop(app, m, DropActorNotReady)
+			m.Recycle()
+		}
+	}
 }
