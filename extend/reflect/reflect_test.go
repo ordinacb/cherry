@@ -1,9 +1,6 @@
 package cherryReflect
 
-import (
-	"fmt"
-	"testing"
-)
+import "testing"
 
 type FunStruct struct {
 }
@@ -17,21 +14,33 @@ func test1111() {}
 func TestGetFuncName(t *testing.T) {
 	f := &FunStruct{}
 
-	result0 := GetFuncName(f)
-	fmt.Println(result0)
-
-	result1 := GetFuncName(f.A)
-	fmt.Println(result1)
-
-	result2 := GetFuncName(test1111)
-	fmt.Println(result2)
+	if got := GetStructName(f); got != "FunStruct" {
+		t.Fatalf("struct name: %s", got)
+	}
+	if got := GetFuncName(f.A); got != "A" {
+		t.Fatalf("method name: %s", got)
+	}
+	if got := GetFuncName(test1111); got != "test1111" {
+		t.Fatalf("function name: %s", got)
+	}
+	t.Run("reject_non_function", func(t *testing.T) {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("non-function was accepted")
+			}
+		}()
+		GetFuncName(f)
+	})
 }
 
 func TestIsPtr(t *testing.T) {
-	fmt.Println(IsPtr(nil))
+	if IsPtr(nil) || !IsPtr(&FunStruct{}) {
+		t.Fatal("incorrect pointer classification")
+	}
 }
 
 func TestIsNotPtr(t *testing.T) {
-	s := &FunStruct{}
-	fmt.Println(IsNotPtr(s))
+	if IsNotPtr(&FunStruct{}) || !IsNotPtr(FunStruct{}) {
+		t.Fatal("incorrect non-pointer classification")
+	}
 }
