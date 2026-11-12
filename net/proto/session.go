@@ -59,6 +59,11 @@ func (x *Session) GetMID() uint32 {
 	return x.Mid
 }
 
+// SetQueueDeadlineMillis sets the deadline on a per-message Session snapshot.
+func (x *Session) SetQueueDeadlineMillis(deadline int64) {
+	x.QueueDeadlineMs = deadline
+}
+
 func (x *Session) ImportAll(data map[string]string) {
 	for k, v := range data {
 		x.Set(k, v)

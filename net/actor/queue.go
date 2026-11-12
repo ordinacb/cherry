@@ -31,14 +31,37 @@ func newQueue() queue {
 	}
 }
 
+type queuePushResult uint8
+
+const (
+	queueAccepted queuePushResult = iota
+	queueClosed
+	queueFull
+)
+
 func (p *queue) Push(v interface{}) bool {
+	return p.push(v, 0) == queueAccepted
+}
+
+// push reserves capacity before publishing the node. A zero limit preserves
+// the existing admission rules for timers and events.
+func (p *queue) push(v interface{}, limit int32) queuePushResult {
 	if v == nil {
-		return false
+		return queueClosed
 	}
 	p.lifecycle.RLock()
 	defer p.lifecycle.RUnlock()
 	if p.closed {
-		return false
+		return queueClosed
+	}
+	for {
+		count := p.Count()
+		if limit > 0 && count >= limit {
+			return queueFull
+		}
+		if atomic.CompareAndSwapInt32(&p.count, count, count+1) {
+			break
+		}
 	}
 
 	n := new(queueNode)
@@ -49,8 +72,8 @@ func (p *queue) Push(v interface{}) bool {
 	// release node to consumer
 	atomic.StorePointer((*unsafe.Pointer)(unsafe.Pointer(&prev.next)), unsafe.Pointer(n))
 
-	p._setCount(1)
-	return true
+	p.signal(p.Count())
+	return queueAccepted
 }
 
 func (p *queue) Pop() interface{} {
@@ -70,7 +93,7 @@ func (p *queue) pop() interface{} {
 		p.tail = next
 		v := next.val
 		next.val = nil
-		p._setCount(-1)
+		p.signal(atomic.AddInt32(&p.count, -1))
 		return v
 	}
 
@@ -92,8 +115,7 @@ func (p *queue) Count() int32 {
 	return atomic.LoadInt32(&p.count)
 }
 
-func (p *queue) _setCount(delta int32) {
-	count := atomic.AddInt32(&p.count, delta)
+func (p *queue) signal(count int32) {
 	if count > 0 {
 		select {
 		case p.C <- count:

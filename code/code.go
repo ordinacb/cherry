@@ -30,6 +30,8 @@ const (
 	ActorNotFound           int32 = 35 // Actor not found
 	ActorInvokeRemoteError  int32 = 36 // remote invoke error
 	ActorResponseIsError    int32 = 37 // response is an error
+	ActorMailboxFull        int32 = 38 // target mailbox has no capacity
+	ActorQueueTimeout       int32 = 39 // message expired before dispatch
 )
 
 // IsOK returns true if code equals OK (0).

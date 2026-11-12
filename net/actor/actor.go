@@ -45,12 +45,13 @@ type (
 		handler          cfacade.IActorHandler // actor handler
 		localMail        *mailbox              // local message mailbox
 		remoteMail       *mailbox              // remote message mailbox
-		event            *actorEvent           // event handle
-		timer            *actorTimer           // timer handle
-		child            *actorChild           // child actor
-		lastAt           int64                 // last process time (ms)
-		arrivalElapsed   int64                 // arrival elapsed for message
-		executionElapsed int64                 // execution elapsed for message
+		mailboxLimits    mailboxLimits
+		event            *actorEvent // event handle
+		timer            *actorTimer // timer handle
+		child            *actorChild // child actor
+		lastAt           int64       // last process time (ms)
+		arrivalElapsed   int64       // arrival elapsed for message
+		executionElapsed int64       // execution elapsed for message
 	}
 )
 
@@ -112,7 +113,12 @@ func (p *Actor) processLocal() {
 	}
 	defer m.Recycle()
 
-	p.lastAt = time.Now().UnixMilli()
+	now := time.Now().UnixMilli()
+	if p.queueExpired(m, true, now) {
+		notifyDrop(p.App(), m, DropQueueExpired)
+		return
+	}
+	p.lastAt = now
 
 	next, invoke := p.handler.OnLocalReceived(m)
 	if invoke {
@@ -149,7 +155,12 @@ func (p *Actor) processRemote() {
 	}
 	defer m.Recycle()
 
-	p.lastAt = time.Now().UnixMilli()
+	now := time.Now().UnixMilli()
+	if p.queueExpired(m, false, now) {
+		notifyDrop(p.App(), m, DropQueueExpired)
+		return
+	}
+	p.lastAt = now
 
 	next, invoke := p.handler.OnRemoteReceived(m)
 	if invoke {
@@ -380,19 +391,50 @@ func (p *Actor) Timer() ITimer {
 }
 
 func (p *Actor) PostRemote(m *cfacade.Message) {
-	m.AddRef()
-	if !p.remoteMail.Push(m) {
-		notifyDrop(p.App(), m, DropActorNotReady)
-		m.Recycle()
-	}
+	p.postMessage(m, false)
 }
 
 func (p *Actor) PostLocal(m *cfacade.Message) {
+	p.postMessage(m, true)
+}
+
+// postMessage consumes one reference whether the mailbox accepts or rejects it.
+func (p *Actor) postMessage(m *cfacade.Message, local bool) string {
 	m.AddRef()
-	if !p.localMail.Push(m) {
-		notifyDrop(p.App(), m, DropActorNotReady)
-		m.Recycle()
+	reason := DropQueueExpired
+	if !p.queueExpired(m, local, time.Now().UnixMilli()) {
+		mb, limit := p.remoteMail, p.mailboxLimits.remote
+		if local {
+			mb, limit = p.localMail, p.mailboxLimits.local
+		} else if p.system.remoteMailboxPriority != nil && !p.priorityRemote(m.FuncName) {
+			limit -= p.mailboxLimits.reserve
+		}
+		switch mb.queue.push(m, limit) {
+		case queueAccepted:
+			return ""
+		case queueFull:
+			reason = DropMailboxFull
+		default:
+			reason = DropActorNotReady
+		}
 	}
+	notifyDrop(p.App(), m, reason)
+	m.Recycle()
+	return reason
+}
+
+func (p *Actor) priorityRemote(name string) bool {
+	return p.system.remoteMailboxPriority != nil && p.system.remoteMailboxPriority(name)
+}
+
+func (p *Actor) queueExpired(m *cfacade.Message, local bool, now int64) bool {
+	if deadline := m.Session.GetQueueDeadlineMs(); deadline > 0 {
+		return now >= deadline
+	}
+	if local {
+		return m.BuildTime > 0 && now-m.BuildTime >= defaultLocalQueueTimeout.Milliseconds()
+	}
+	return m.RPCDeadlineMs > 0 && now >= m.RPCDeadlineMs && !p.priorityRemote(m.FuncName)
 }
 
 func (p *Actor) PostEvent(data cfacade.IEventData) {
@@ -415,6 +457,10 @@ func newActor(actorID, childID string, handler cfacade.IActorHandler, c *System)
 		close:   make(chan struct{}, 1),
 		handler: handler,
 		lastAt:  time.Now().UnixMilli(),
+	}
+	thisActor.mailboxLimits = c.mailboxes
+	if limits, ok := c.actorMailboxLimits[actorID]; ok && childID == "" {
+		thisActor.mailboxLimits = limits
 	}
 
 	// Default init state

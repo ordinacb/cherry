@@ -47,9 +47,10 @@ type (
 		Session *cproto.Session // client session
 
 		// --- Remote only (Actor->Actor, set by System.Call/CallWait/CallType) ---
-		ReqID      string           // NATS request ID (cross-node request-reply)
-		Reply      string           // NATS reply subject (non-empty if from cross-node)
-		ChanResult chan interface{} // same-node CallWait reply channel (buffered 1)
+		ReqID         string           // NATS request ID (cross-node request-reply)
+		Reply         string           // NATS reply subject (non-empty if from cross-node)
+		ChanResult    chan interface{} // same-node CallWait reply channel (buffered 1)
+		RPCDeadlineMs int64            // original deadline for starting a synchronous RPC
 
 		targetPath *ActorPath // lazily cached on first TargetPath() call; cleared in Recycle()
 	}
@@ -80,6 +81,7 @@ func (p *Message) Marshal() ([]byte, error) {
 	cp.TargetPath = p.Target
 	cp.FuncName = p.FuncName
 	cp.Session = p.Session
+	cp.RpcDeadlineMs = p.RPCDeadlineMs
 
 	if argBytes, ok := p.Args.([]byte); ok {
 		cp.ArgBytes = argBytes
@@ -103,6 +105,7 @@ func (p *Message) Unmarshal(data []byte) error {
 	p.FuncName = cp.FuncName
 	p.Args = cp.ArgBytes // keep as []byte, decoded on-demand by Actor
 	p.Session = cp.Session
+	p.RPCDeadlineMs = cp.RpcDeadlineMs
 
 	return nil
 }
@@ -120,7 +123,13 @@ func (p *Message) Clone() *Message {
 	clone.ReqID = p.ReqID
 	clone.Reply = p.Reply
 	clone.ChanResult = p.ChanResult // shared (CallWait sync channel)
+	clone.RPCDeadlineMs = p.RPCDeadlineMs
 	return clone
+}
+
+// CopyRPCDeadlineFrom preserves the original caller's deadline on a relay.
+func (p *Message) CopyRPCDeadlineFrom(source *Message) {
+	p.RPCDeadlineMs = source.RPCDeadlineMs
 }
 
 // AddRef increments the reference count. Each call to PostLocal/PostRemote
@@ -147,6 +156,7 @@ func (p *Message) Recycle() {
 	p.ReqID = ""
 	p.Reply = ""
 	p.ChanResult = nil
+	p.RPCDeadlineMs = 0
 	p.targetPath = nil
 	messagePool.Put(p)
 }

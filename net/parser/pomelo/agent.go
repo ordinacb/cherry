@@ -321,6 +321,8 @@ func (a *Agent) Close() {
 // closeClean tears down the agent: runs onClose callbacks, unbinds,
 // closes the connection, and logs.
 func (a *Agent) closeClean() {
+	// Release the socket before callbacks that may wait for a disconnect ack.
+	closeErr := a.conn.Close()
 	for _, fn := range a.onCloseFunc {
 		cutils.Try(func() { fn(a) }, func(errString string) {
 			clog.Warnf("[sid = %s,uid = %d] onCloseFunc error = %s",
@@ -331,7 +333,6 @@ func (a *Agent) closeClean() {
 	// remove from sidAgentMap and uidMap
 	a.Unbind()
 
-	closeErr := a.conn.Close()
 	if clog.PrintLevel(zapcore.InfoLevel) {
 		clog.Infof("[sid = %s,uid = %d] Agent closed. [count = %d, ip = %s, error = %v]",
 			a.SID(), a.UID(), Count(), a.RemoteAddr(), closeErr)

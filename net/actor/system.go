@@ -13,23 +13,35 @@ import (
 	cproto "github.com/cherry-game/cherry/net/proto"
 )
 
-const ()
+const (
+	defaultLocalMailboxSize     int32 = 256
+	defaultRemoteMailboxSize    int32 = 512
+	defaultRemoteMailboxReserve int32 = 128
+	defaultLocalQueueTimeout          = 10 * time.Second
+)
 
 type (
 	// System is the Actor system
 	System struct {
-		app              cfacade.IApplication  // application
-		actorMap         *sync.Map             // key:actorID, value:*actor
-		actorEventMap    *sync.Map             // map[string]map[string]int64 => key:eventName, value:map[actorPath]uniqueID
-		localInvokeFunc  cfacade.InvokeFunc    // default local func
-		remoteInvokeFunc cfacade.InvokeFunc    // default remote func
-		wg               *sync.WaitGroup       // wait group
-		callTimeout      time.Duration         // call timeout
-		arrivalTimeOut   int64                 // message arrival timeout (ms)
-		executionTimeout int64                 // message execution timeout (ms)
-		timeWheel        *ctimeWheel.TimeWheel // global timer for all actors
-		timerTick        time.Duration         // time wheel tick, configured before Start
-		timerHint        int                   // time wheel nodeMap pre-alloc hint
+		app                   cfacade.IApplication  // application
+		actorMap              *sync.Map             // key:actorID, value:*actor
+		actorEventMap         *sync.Map             // map[string]map[string]int64 => key:eventName, value:map[actorPath]uniqueID
+		localInvokeFunc       cfacade.InvokeFunc    // default local func
+		remoteInvokeFunc      cfacade.InvokeFunc    // default remote func
+		wg                    *sync.WaitGroup       // wait group
+		callTimeout           time.Duration         // call timeout
+		arrivalTimeOut        int64                 // message arrival timeout (ms)
+		executionTimeout      int64                 // message execution timeout (ms)
+		timeWheel             *ctimeWheel.TimeWheel // global timer for all actors
+		timerTick             time.Duration         // time wheel tick, configured before Start
+		timerHint             int                   // time wheel nodeMap pre-alloc hint
+		mailboxes             mailboxLimits
+		actorMailboxLimits    map[string]mailboxLimits
+		remoteMailboxPriority func(string) bool
+	}
+
+	mailboxLimits struct {
+		local, remote, reserve int32
 	}
 )
 
@@ -45,9 +57,35 @@ func NewSystem() *System {
 		callTimeout:      3 * time.Second,
 		arrivalTimeOut:   100,
 		executionTimeout: 100,
+		mailboxes:        mailboxLimits{local: defaultLocalMailboxSize, remote: defaultRemoteMailboxSize, reserve: defaultRemoteMailboxReserve},
 	}
 
 	return system
+}
+
+// SetMailboxLimits sets per-Actor pending-message limits before startup.
+// remote includes the slots reserved for priority Remote messages.
+func (p *System) SetMailboxLimits(local, remote, reserve int32) {
+	if local > 0 && remote > 0 && reserve >= 0 && reserve < remote {
+		p.mailboxes = mailboxLimits{local: local, remote: remote, reserve: reserve}
+	}
+}
+
+// SetActorMailboxLimits overrides a root Actor's limits before startup.
+func (p *System) SetActorMailboxLimits(actorID string, local, remote, reserve int32) {
+	if actorID == "" || local <= 0 || remote <= 0 || reserve < 0 || reserve >= remote {
+		return
+	}
+	if p.actorMailboxLimits == nil {
+		p.actorMailboxLimits = make(map[string]mailboxLimits)
+	}
+	p.actorMailboxLimits[actorID] = mailboxLimits{local: local, remote: remote, reserve: reserve}
+}
+
+// SetRemoteMailboxPriority identifies Remote functions that can use reserved
+// slots. Set it before startup. All accepted Remote messages keep FIFO order.
+func (p *System) SetRemoteMailboxPriority(priority func(string) bool) {
+	p.remoteMailboxPriority = priority
 }
 
 func (p *System) Start(app cfacade.IApplication) {
@@ -227,9 +265,9 @@ func (p *System) Call(source, target, funcName string, arg any) int32 {
 		remoteMsg.FuncName = funcName
 		remoteMsg.Args = arg
 
-		if !p.PostRemote(remoteMsg) {
+		if reason := p.postToActor(remoteMsg, false); reason != "" {
 			clog.Warnf("[Call] Post remote fail. [source = %s, target = %s, funcName = %s]", source, target, funcName)
-			return ccode.ActorInvokeRemoteError
+			return mailboxDropCode(reason)
 		}
 	}
 
@@ -286,6 +324,7 @@ func (p *System) CallWait(source, target, funcName string, arg, reply any) int32
 			return errCode
 		}
 
+		remoteMsg.RPCDeadlineMs = remoteMsg.BuildTime + p.callTimeout.Milliseconds()
 		// RequestRemote recycles remoteMsg via defer on all paths.
 		rspData, rspCode := p.app.Cluster().RequestRemote(targetPath.NodeID, remoteMsg, p.callTimeout)
 		if ccode.IsFail(rspCode) {
@@ -305,6 +344,7 @@ func (p *System) CallWait(source, target, funcName string, arg, reply any) int32
 		message.Target = target
 		message.FuncName = funcName
 		message.Args = arg
+		message.RPCDeadlineMs = message.BuildTime + p.callTimeout.Milliseconds()
 		// 接收方可能立即回收 message；等待方只读取投递前保存的通道。
 		resultChan := make(chan interface{}, 1)
 		message.ChanResult = resultChan
@@ -315,11 +355,13 @@ func (p *System) CallWait(source, target, funcName string, arg, reply any) int32
 				message.Recycle()
 				return ccode.ActorChildIDNotFound
 			}
-			childActor.PostRemote(message)
+			if reason := childActor.postMessage(message, false); reason != "" {
+				return mailboxDropCode(reason)
+			}
 		} else {
-			if !p.PostRemote(message) {
+			if reason := p.postToActor(message, false); reason != "" {
 				clog.Warnf("[CallWait] Post remote fail. [source = %s, target = %s, funcName = %s]", source, target, funcName)
-				return ccode.ActorInvokeRemoteError
+				return mailboxDropCode(reason)
 			}
 		}
 
@@ -429,52 +471,35 @@ func (p *System) CallType(nodeType, actorID, funcName string, arg any) int32 {
 
 // PostRemote delivers message to the remote mailbox.
 func (p *System) PostRemote(m *cfacade.Message) bool {
-	if m == nil {
-		clog.Error("Message is nil.")
-		return false
-	}
-
-	targetActor, found := p.GetActor(m.TargetPath().ActorID)
-	if !found {
-		clog.Warnf("[PostRemote] actor not found. [source = %s, target = %s -> %s]", m.Source, m.Target, m.FuncName)
-		notifyDrop(p.app, m, DropActorNotFound)
-		m.Recycle()
-		return false
-	}
-
-	if targetActor.State() != WorkerState {
-		notifyDrop(p.app, m, DropActorNotReady)
-		m.Recycle()
-		return false
-	}
-
-	targetActor.PostRemote(m)
-	return true
+	return p.postToActor(m, false) == ""
 }
 
 // PostLocal delivers message to the local mailbox.
 func (p *System) PostLocal(m *cfacade.Message) bool {
+	return p.postToActor(m, true) == ""
+}
+
+func (p *System) postToActor(m *cfacade.Message, local bool) string {
 	if m == nil {
 		clog.Error("Message is nil.")
-		return false
+		return DropActorNotFound
 	}
 
 	targetActor, found := p.GetActor(m.TargetPath().ActorID)
 	if !found {
-		clog.Warnf("[PostLocal] actor not found. [source = %s, target = %s -> %s]", m.Source, m.Target, m.FuncName)
+		clog.Warnf("[Post] actor not found. [source = %s, target = %s -> %s]", m.Source, m.Target, m.FuncName)
 		notifyDrop(p.app, m, DropActorNotFound)
 		m.Recycle()
-		return false
+		return DropActorNotFound
 	}
 
 	if targetActor.State() != WorkerState {
 		notifyDrop(p.app, m, DropActorNotReady)
 		m.Recycle()
-		return false
+		return DropActorNotReady
 	}
 
-	targetActor.PostLocal(m)
-	return true
+	return targetActor.postMessage(m, local)
 }
 
 // PostEvent delivers an event to subscribed actors

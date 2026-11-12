@@ -27,5 +27,6 @@ func (x *ClusterPacket) Recycle() {
 	x.FuncName = ""
 	x.ArgBytes = nil
 	x.Session = nil
+	x.RpcDeadlineMs = 0
 	clusterPacketPool.Put(x)
 }

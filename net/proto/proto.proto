@@ -41,6 +41,7 @@ message ClusterPacket {
   string funcName = 4;
   bytes argBytes = 5;
   Session session = 6;
+  int64 rpc_deadline_ms = 7; // original synchronous RPC queue deadline
 }
 
 message Session {
@@ -50,6 +51,7 @@ message Session {
   string ip = 4;                  // ip address
   uint32 mid = 5;                 // message id of the message being routed; per message, not session state
   map<string, string> data = 7;   // extend data
+  int64 queue_deadline_ms = 8;    // absolute deadline for starting this client request
 }
 
 message PomeloResponse {

@@ -1,8 +1,10 @@
 package cherryActor
 
 import (
+	ccode "github.com/cherry-game/cherry/code"
 	cfacade "github.com/cherry-game/cherry/facade"
 	clog "github.com/cherry-game/cherry/logger"
+	cproto "github.com/cherry-game/cherry/net/proto"
 )
 
 // Reasons passed to a DropHandler.
@@ -11,6 +13,8 @@ const (
 	DropActorNotReady = "actor_not_ready"
 	DropChildNotFound = "child_not_found"
 	DropFuncNotFound  = "func_not_found"
+	DropMailboxFull   = "actor_mailbox_full"
+	DropQueueExpired  = "actor_queue_expired"
 )
 
 // DropHandler is called when a message is discarded before reaching a handler.
@@ -25,7 +29,24 @@ var dropHandler DropHandler
 func SetDropHandler(fn DropHandler) { dropHandler = fn }
 
 func notifyDrop(app cfacade.IApplication, m *cfacade.Message, reason string) {
-	if dropHandler == nil || m == nil {
+	if m == nil {
+		return
+	}
+	if reason == DropMailboxFull || reason == DropQueueExpired {
+		status := mailboxDropCode(reason)
+		switch {
+		case m.ChanResult != nil:
+			select {
+			case m.ChanResult <- &cproto.Response{Code: status}:
+			default:
+			}
+			return
+		case m.Reply != "":
+			replyReponseCode(app, m, status)
+			return
+		}
+	}
+	if dropHandler == nil {
 		return
 	}
 	defer func() {
@@ -34,4 +55,15 @@ func notifyDrop(app cfacade.IApplication, m *cfacade.Message, reason string) {
 		}
 	}()
 	dropHandler(app, m, reason)
+}
+
+func mailboxDropCode(reason string) int32 {
+	switch reason {
+	case DropMailboxFull:
+		return ccode.ActorMailboxFull
+	case DropQueueExpired:
+		return ccode.ActorQueueTimeout
+	default:
+		return ccode.ActorInvokeRemoteError
+	}
 }
