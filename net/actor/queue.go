@@ -13,6 +13,7 @@ type (
 		head, tail *queueNode
 		C          chan int32
 		count      int32
+		totalDepth *atomic.Int64 // optional node-wide Remote depth
 	}
 
 	queueNode struct {
@@ -44,7 +45,7 @@ func (p *queue) Push(v interface{}) bool {
 }
 
 // push reserves capacity before publishing the node. A zero limit preserves
-// the existing admission rules for timers and events.
+// the existing admission rules for Remote, timers and events.
 func (p *queue) push(v interface{}, limit int32) queuePushResult {
 	if v == nil {
 		return queueClosed
@@ -64,6 +65,9 @@ func (p *queue) push(v interface{}, limit int32) queuePushResult {
 		}
 	}
 
+	if p.totalDepth != nil {
+		p.totalDepth.Add(1)
+	}
 	n := new(queueNode)
 	n.val = v
 	// current producer acquires head node
@@ -93,6 +97,9 @@ func (p *queue) pop() interface{} {
 		p.tail = next
 		v := next.val
 		next.val = nil
+		if p.totalDepth != nil {
+			p.totalDepth.Add(-1)
+		}
 		p.signal(atomic.AddInt32(&p.count, -1))
 		return v
 	}

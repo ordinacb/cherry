@@ -350,6 +350,13 @@ func (p *Component) RawPublish(subject string, data []byte) error {
 	return p.publishConnect.Publish(subject, data)
 }
 
+// RawSubscribe registers a transport-level callback that runs outside Actor mailboxes.
+func (p *Component) RawSubscribe(subject string, receive func([]byte)) error {
+	return p.subscribeConnect.Subscribe(subject, func(msg *nats.Msg) {
+		receive(msg.Data)
+	})
+}
+
 // RawRequest sends a request to a raw subject via the publish connect.
 func (p *Component) RawRequest(subject string, data []byte, timeout ...time.Duration) ([]byte, error) {
 	return p.publishConnect.Request(subject, data, timeout...)

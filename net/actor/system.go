@@ -3,6 +3,7 @@ package cherryActor
 import (
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	ccode "github.com/cherry-game/cherry/code"
@@ -14,78 +15,58 @@ import (
 )
 
 const (
-	defaultLocalMailboxSize     int32 = 256
-	defaultRemoteMailboxSize    int32 = 512
-	defaultRemoteMailboxReserve int32 = 128
-	defaultLocalQueueTimeout          = 10 * time.Second
+	defaultLocalMailboxSize  int32 = 256
+	defaultLocalQueueTimeout       = 10 * time.Second
 )
 
 type (
 	// System is the Actor system
 	System struct {
-		app                   cfacade.IApplication  // application
-		actorMap              *sync.Map             // key:actorID, value:*actor
-		actorEventMap         *sync.Map             // map[string]map[string]int64 => key:eventName, value:map[actorPath]uniqueID
-		localInvokeFunc       cfacade.InvokeFunc    // default local func
-		remoteInvokeFunc      cfacade.InvokeFunc    // default remote func
-		wg                    *sync.WaitGroup       // wait group
-		callTimeout           time.Duration         // call timeout
-		arrivalTimeOut        int64                 // message arrival timeout (ms)
-		executionTimeout      int64                 // message execution timeout (ms)
-		timeWheel             *ctimeWheel.TimeWheel // global timer for all actors
-		timerTick             time.Duration         // time wheel tick, configured before Start
-		timerHint             int                   // time wheel nodeMap pre-alloc hint
-		mailboxes             mailboxLimits
-		actorMailboxLimits    map[string]mailboxLimits
-		remoteMailboxPriority func(string) bool
-	}
-
-	mailboxLimits struct {
-		local, remote, reserve int32
+		app                cfacade.IApplication  // application
+		actorMap           *sync.Map             // key:actorID, value:*actor
+		actorEventMap      *sync.Map             // map[string]map[string]int64 => key:eventName, value:map[actorPath]uniqueID
+		localInvokeFunc    cfacade.InvokeFunc    // default local func
+		remoteInvokeFunc   cfacade.InvokeFunc    // default remote func
+		wg                 *sync.WaitGroup       // wait group
+		callTimeout        time.Duration         // call timeout
+		arrivalTimeOut     int64                 // message arrival timeout (ms)
+		executionTimeout   int64                 // message execution timeout (ms)
+		timeWheel          *ctimeWheel.TimeWheel // global timer for all actors
+		timerTick          time.Duration         // time wheel tick, configured before Start
+		timerHint          int                   // time wheel nodeMap pre-alloc hint
+		localMailboxLimit  int32
+		remoteMailboxDepth atomic.Int64
 	}
 )
 
 func NewSystem() *System {
 	system := &System{
-		actorMap:         &sync.Map{},
-		actorEventMap:    &sync.Map{},
-		localInvokeFunc:  InvokeLocalFunc,
-		remoteInvokeFunc: InvokeRemoteFunc,
-		wg:               &sync.WaitGroup{},
-		timerTick:        ctimeWheel.DefaultTick,
-		timerHint:        1024,
-		callTimeout:      3 * time.Second,
-		arrivalTimeOut:   100,
-		executionTimeout: 100,
-		mailboxes:        mailboxLimits{local: defaultLocalMailboxSize, remote: defaultRemoteMailboxSize, reserve: defaultRemoteMailboxReserve},
+		actorMap:          &sync.Map{},
+		actorEventMap:     &sync.Map{},
+		localInvokeFunc:   InvokeLocalFunc,
+		remoteInvokeFunc:  InvokeRemoteFunc,
+		wg:                &sync.WaitGroup{},
+		timerTick:         ctimeWheel.DefaultTick,
+		timerHint:         1024,
+		callTimeout:       3 * time.Second,
+		arrivalTimeOut:    100,
+		executionTimeout:  100,
+		localMailboxLimit: defaultLocalMailboxSize,
 	}
 
 	return system
 }
 
-// SetMailboxLimits sets per-Actor pending-message limits before startup.
-// remote includes the slots reserved for priority Remote messages.
-func (p *System) SetMailboxLimits(local, remote, reserve int32) {
-	if local > 0 && remote > 0 && reserve >= 0 && reserve < remote {
-		p.mailboxes = mailboxLimits{local: local, remote: remote, reserve: reserve}
+// SetLocalMailboxLimit sets the per-Actor client queue limit before startup.
+func (p *System) SetLocalMailboxLimit(limit int32) {
+	if limit > 0 {
+		p.localMailboxLimit = limit
 	}
 }
 
-// SetActorMailboxLimits overrides a root Actor's limits before startup.
-func (p *System) SetActorMailboxLimits(actorID string, local, remote, reserve int32) {
-	if actorID == "" || local <= 0 || remote <= 0 || reserve < 0 || reserve >= remote {
-		return
-	}
-	if p.actorMailboxLimits == nil {
-		p.actorMailboxLimits = make(map[string]mailboxLimits)
-	}
-	p.actorMailboxLimits[actorID] = mailboxLimits{local: local, remote: remote, reserve: reserve}
-}
-
-// SetRemoteMailboxPriority identifies Remote functions that can use reserved
-// slots. Set it before startup. All accepted Remote messages keep FIFO order.
-func (p *System) SetRemoteMailboxPriority(priority func(string) bool) {
-	p.remoteMailboxPriority = priority
+// RemoteMailboxDepth reports the total number of queued Remote messages on this node.
+func (p *System) RemoteMailboxDepth() int64 {
+	return p.remoteMailboxDepth.Load()
 }
 
 func (p *System) Start(app cfacade.IApplication) {

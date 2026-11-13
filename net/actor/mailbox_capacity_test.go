@@ -91,43 +91,63 @@ func TestQueueDeadlineSurvivesClusterPacketAndClone(t *testing.T) {
 	}
 }
 
-func TestExpiredRemoteRPCPreservesPriority(t *testing.T) {
-	system := NewSystem()
-	system.SetRemoteMailboxPriority(func(name string) bool { return name == "priority" })
-	actor := &Actor{system: system}
+func TestExpiredRemoteRPCUsesCallerDeadline(t *testing.T) {
+	actor := &Actor{system: NewSystem()}
 	message := cfacade.GetMessage()
 	defer message.Recycle()
 	message.RPCDeadlineMs = 1000
 	if actor.queueExpired(message, false, 999) || !actor.queueExpired(message, false, 1000) {
 		t.Fatal("ordinary RPC did not honor the caller deadline")
 	}
-	message.FuncName = "priority"
-	if actor.queueExpired(message, false, 2000) {
-		t.Fatal("priority RPC must remain eligible when the caller times out")
+}
+
+func TestRemoteMailboxDrainsBeyondFormerLimitInFIFO(t *testing.T) {
+	system := NewSystem()
+	actor, err := newActor("blocked", "", &Base{}, system)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer actor.remoteMail.onStop(nil)
+	const count = 1024
+	for i := range count {
+		m := cfacade.GetMessage()
+		m.Args = i
+		if reason := actor.postMessage(m, false); reason != "" {
+			t.Fatalf("message %d rejected: %s", i, reason)
+		}
+	}
+	if got := system.RemoteMailboxDepth(); got != count {
+		t.Fatalf("depth = %d, want %d", got, count)
+	}
+	for i := range count {
+		m := actor.remoteMail.Pop()
+		if m == nil || m.Args != i {
+			t.Fatalf("FIFO interrupted at %d", i)
+		}
+		m.Recycle()
+	}
+	if got := system.RemoteMailboxDepth(); got != 0 {
+		t.Fatalf("depth after drain = %d", got)
 	}
 }
 
-func TestRemoteMailboxFullRepliesOnOriginalSubject(t *testing.T) {
+func TestExpiredRemoteRPCRepliesOnOriginalSubject(t *testing.T) {
 	cluster := &mailboxReplyCluster{}
 	system := NewSystem()
 	system.app = &mailboxReplyApp{cluster: cluster}
-	system.SetMailboxLimits(1, 1, 0)
 	actor, err := newActor("blocked", "", &Base{}, system)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer actor.remoteMail.onStop(system.app)
 
-	first := cfacade.GetMessage()
-	if reason := actor.postMessage(first, false); reason != "" {
-		t.Fatal(reason)
-	}
-	overflow := cfacade.GetMessage()
-	overflow.ReqID, overflow.Reply = "req-42", "remote.replies"
-	if reason := actor.postMessage(overflow, false); reason != DropMailboxFull {
+	expired := cfacade.GetMessage()
+	expired.ReqID, expired.Reply = "req-42", "remote.replies"
+	expired.RPCDeadlineMs = time.Now().Add(-time.Second).UnixMilli()
+	if reason := actor.postMessage(expired, false); reason != DropQueueExpired {
 		t.Fatalf("unexpected drop reason %q", reason)
 	}
-	if cluster.reqID != "req-42" || cluster.subject != "remote.replies" || cluster.code != ccode.ActorMailboxFull {
+	if cluster.reqID != "req-42" || cluster.subject != "remote.replies" || cluster.code != ccode.ActorQueueTimeout {
 		t.Fatalf("wrong overflow reply req=%s subject=%s code=%d", cluster.reqID, cluster.subject, cluster.code)
 	}
 }

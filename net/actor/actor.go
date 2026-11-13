@@ -45,13 +45,12 @@ type (
 		handler          cfacade.IActorHandler // actor handler
 		localMail        *mailbox              // local message mailbox
 		remoteMail       *mailbox              // remote message mailbox
-		mailboxLimits    mailboxLimits
-		event            *actorEvent // event handle
-		timer            *actorTimer // timer handle
-		child            *actorChild // child actor
-		lastAt           int64       // last process time (ms)
-		arrivalElapsed   int64       // arrival elapsed for message
-		executionElapsed int64       // execution elapsed for message
+		event            *actorEvent           // event handle
+		timer            *actorTimer           // timer handle
+		child            *actorChild           // child actor
+		lastAt           int64                 // last process time (ms)
+		arrivalElapsed   int64                 // arrival elapsed for message
+		executionElapsed int64                 // execution elapsed for message
 	}
 )
 
@@ -403,11 +402,9 @@ func (p *Actor) postMessage(m *cfacade.Message, local bool) string {
 	m.AddRef()
 	reason := DropQueueExpired
 	if !p.queueExpired(m, local, time.Now().UnixMilli()) {
-		mb, limit := p.remoteMail, p.mailboxLimits.remote
+		mb, limit := p.remoteMail, int32(0)
 		if local {
-			mb, limit = p.localMail, p.mailboxLimits.local
-		} else if p.system.remoteMailboxPriority != nil && !p.priorityRemote(m.FuncName) {
-			limit -= p.mailboxLimits.reserve
+			mb, limit = p.localMail, p.system.localMailboxLimit
 		}
 		switch mb.queue.push(m, limit) {
 		case queueAccepted:
@@ -423,10 +420,6 @@ func (p *Actor) postMessage(m *cfacade.Message, local bool) string {
 	return reason
 }
 
-func (p *Actor) priorityRemote(name string) bool {
-	return p.system.remoteMailboxPriority != nil && p.system.remoteMailboxPriority(name)
-}
-
 func (p *Actor) queueExpired(m *cfacade.Message, local bool, now int64) bool {
 	if deadline := m.Session.GetQueueDeadlineMs(); deadline > 0 {
 		return now >= deadline
@@ -434,7 +427,7 @@ func (p *Actor) queueExpired(m *cfacade.Message, local bool, now int64) bool {
 	if local {
 		return m.BuildTime > 0 && now-m.BuildTime >= defaultLocalQueueTimeout.Milliseconds()
 	}
-	return m.RPCDeadlineMs > 0 && now >= m.RPCDeadlineMs && !p.priorityRemote(m.FuncName)
+	return m.RPCDeadlineMs > 0 && now >= m.RPCDeadlineMs
 }
 
 func (p *Actor) PostEvent(data cfacade.IEventData) {
@@ -458,10 +451,6 @@ func newActor(actorID, childID string, handler cfacade.IActorHandler, c *System)
 		handler: handler,
 		lastAt:  time.Now().UnixMilli(),
 	}
-	thisActor.mailboxLimits = c.mailboxes
-	if limits, ok := c.actorMailboxLimits[actorID]; ok && childID == "" {
-		thisActor.mailboxLimits = limits
-	}
 
 	// Default init state
 	thisActor.setState(InitState)
@@ -470,6 +459,7 @@ func newActor(actorID, childID string, handler cfacade.IActorHandler, c *System)
 	thisActor.localMail = &localMailbox
 
 	remoteMailbox := newMailbox(RemoteName)
+	remoteMailbox.totalDepth = &c.remoteMailboxDepth
 	thisActor.remoteMail = &remoteMailbox
 
 	event := newEvent(&thisActor)
