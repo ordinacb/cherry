@@ -460,13 +460,20 @@ func (p *System) PostLocal(m *cfacade.Message) bool {
 	return p.postToActor(m, true) == ""
 }
 
+// A parent may opt in to bypassing its Local receive hook for running children.
+// The method is called by producers, so it must be safe outside the actor loop.
+type directLocalChildParent interface {
+	DirectLocalChild() bool
+}
+
 func (p *System) postToActor(m *cfacade.Message, local bool) string {
 	if m == nil {
 		clog.Error("Message is nil.")
 		return DropActorNotFound
 	}
 
-	targetActor, found := p.GetActor(m.TargetPath().ActorID)
+	target := m.TargetPath()
+	targetActor, found := p.GetActor(target.ActorID)
 	if !found {
 		clog.Warnf("[Post] actor not found. [source = %s, target = %s -> %s]", m.Source, m.Target, m.FuncName)
 		notifyDrop(p.app, m, DropActorNotFound)
@@ -480,6 +487,13 @@ func (p *System) postToActor(m *cfacade.Message, local bool) string {
 		return DropActorNotReady
 	}
 
+	if local && target.IsChild() {
+		if parent, ok := targetActor.handler.(directLocalChildParent); ok && parent.DirectLocalChild() {
+			if child, found := targetActor.child.GetActor(target.ChildID); found && child.State() == WorkerState {
+				return child.postMessage(m, true)
+			}
+		}
+	}
 	return targetActor.postMessage(m, local)
 }
 
