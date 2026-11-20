@@ -220,27 +220,15 @@ func (p *Actor) invokeFunc(mb *mailbox, app cfacade.IApplication, fn cfacade.Inv
 
 	p.arrivalElapsed = p.lastAt - m.BuildTime
 	if p.arrivalElapsed > p.system.arrivalTimeOut {
-		clog.Warnf("[%s] message arrived in %dms (limit=%dms) source=%s target=%s func=%s",
-			mb.name,
-			p.arrivalElapsed,
-			p.system.arrivalTimeOut,
-			m.Source,
-			m.Target,
-			m.FuncName,
-		)
+		p.system.slowMessages.record(slowMessageKey{mb.name, "arrival", m.Target, m.FuncName},
+			m.Source, p.arrivalElapsed, p.system.arrivalTimeOut, p.lastAt)
 	}
 
 	defer func() {
 		p.executionElapsed = time.Now().UnixMilli() - p.lastAt
 		if p.executionElapsed > p.system.executionTimeout {
-			clog.Warnf("[%s] message executed in %dms (limit=%dms) source=%s target=%s func=%s",
-				mb.name,
-				p.executionElapsed,
-				p.system.executionTimeout,
-				m.Source,
-				m.Target,
-				m.FuncName,
-			)
+			p.system.slowMessages.record(slowMessageKey{mb.name, "execution", m.Target, m.FuncName},
+				m.Source, p.executionElapsed, p.system.executionTimeout, time.Now().UnixMilli())
 		}
 
 		if rev := recover(); rev != nil {

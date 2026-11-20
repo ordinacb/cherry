@@ -1,6 +1,8 @@
 package pomelo
 
 import (
+	"strconv"
+	"sync"
 	"testing"
 
 	cfacade "github.com/cherry-game/cherry/facade"
@@ -107,6 +109,40 @@ func TestUnbindKeepsNewSIDMapping(t *testing.T) {
 	}
 }
 
+func TestConcurrentUnbindKeepsNewSIDMapping(t *testing.T) {
+	const uid = 401
+	old := newTestAgent("concurrent-old")
+	next := newTestAgent("concurrent-new")
+	BindSID(next)
+	t.Cleanup(func() { Unbind(next.SID()) })
+
+	closing := make(chan struct{})
+	closed := make(chan struct{})
+	go func() {
+		for range closing {
+			Unbind(old.SID())
+			closed <- struct{}{}
+		}
+	}()
+	defer close(closing)
+
+	for i := range 1024 {
+		BindSID(old)
+		if _, err := Bind(old.SID(), uid); err != nil {
+			t.Fatal(err)
+		}
+		closing <- struct{}{}
+		_, err := Bind(next.SID(), uid)
+		<-closed
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, ok := GetAgentWithUID(uid); !ok || got != next {
+			t.Fatalf("round %d: old disconnect removed the new UID binding", i)
+		}
+	}
+}
+
 func TestGetAgent(t *testing.T) {
 	agent := newTestAgent("sid-5")
 	BindSID(agent)
@@ -133,18 +169,85 @@ func TestCountAndForeach(t *testing.T) {
 
 	for i := 0; i < 3; i++ {
 		sid := cfacade.SID("sid-foreach-" + string(rune('a'+i)))
+		t.Cleanup(func() { Unbind(sid) })
 		BindSID(newTestAgent(string(sid)))
 	}
 
-	if Count() < before+3 {
-		t.Fatalf("Count should be at least %d, got %d", before+3, Count())
+	if got := Count(); got != before+3 {
+		t.Fatalf("Count = %d, want %d", got, before+3)
 	}
 
 	seen := 0
 	ForeachAgent(func(a *Agent) {
 		seen++
 	})
-	if seen < before+3 {
-		t.Fatalf("ForeachAgent saw %d, expected at least %d", seen, before+3)
+	if seen != before+3 {
+		t.Fatalf("ForeachAgent saw %d, want %d", seen, before+3)
+	}
+}
+
+func TestCountSIDReplacement(t *testing.T) {
+	before := Count()
+	const sid = "count-replacement"
+	t.Cleanup(func() { Unbind(sid) })
+	first, next := newTestAgent(sid), newTestAgent(sid)
+	BindSID(first)
+	BindSID(first)
+	BindSID(next)
+	if agent, _ := GetAgentWithSID(sid); agent != next {
+		t.Fatal("expected replacement agent for SID")
+	}
+	if got := Count(); got != before+1 {
+		t.Fatalf("Count after replacement = %d, want %d", got, before+1)
+	}
+	Unbind(sid)
+	Unbind(sid)
+	if got := Count(); got != before {
+		t.Fatalf("Count after repeated unbind = %d, want %d", got, before)
+	}
+}
+
+func TestCountConcurrentSIDChurn(t *testing.T) {
+	before := Count()
+	const sid = "count-concurrent"
+	t.Cleanup(func() { Unbind(sid) })
+	start := make(chan struct{})
+	var workers sync.WaitGroup
+	for range 8 {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			agent := newTestAgent(sid)
+			<-start
+			for range 64 {
+				BindSID(agent)
+				Unbind(sid)
+				if got := Count(); got < before || got > before+1 {
+					t.Errorf("Count with one churning SID = %d, want %d..%d", got, before, before+1)
+					return
+				}
+			}
+		}()
+	}
+	close(start)
+	workers.Wait()
+	if got := Count(); got != before {
+		t.Fatalf("Count after churn = %d, want %d", got, before)
+	}
+}
+
+func BenchmarkCount(b *testing.B) {
+	for _, size := range []int{1, 1000, 10000} {
+		b.Run(strconv.Itoa(size), func(b *testing.B) {
+			for i := range size {
+				agent := newTestAgent("count-bench-" + strconv.Itoa(i))
+				BindSID(agent)
+				b.Cleanup(func() { popAgent(agent.SID()) })
+			}
+			b.ReportAllocs()
+			for b.Loop() {
+				Count()
+			}
+		})
 	}
 }

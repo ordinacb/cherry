@@ -11,11 +11,18 @@ import (
 var (
 	sidAgentMap = sync.Map{} // sid → *Agent
 	uidMap      = sync.Map{} // uid → sid
+	// Serialize SID membership changes with Count. Lookups and Range only need sync.Map.
+	sidCountMu sync.Mutex
+	sidCount   int
 )
 
 // BindSID registers an agent in the sid lookup map.
 func BindSID(agent *Agent) {
-	sidAgentMap.Store(agent.SID(), agent)
+	sidCountMu.Lock()
+	defer sidCountMu.Unlock()
+	if _, replaced := sidAgentMap.Swap(agent.SID(), agent); !replaced {
+		sidCount++
+	}
 }
 
 // Bind associates a uid with an existing sid.
@@ -52,19 +59,20 @@ func Unbind(sid cfacade.SID) {
 		return
 	}
 
-	if nowSID, ok := GetSID(agent.UID()); ok && nowSID == sid {
-		uidMap.Delete(agent.UID())
-	}
+	uidMap.CompareAndDelete(agent.UID(), sid)
 
 	clog.Debugf("Unbind agent. sid = %s", sid)
 }
 
 // popAgent looks up and removes an agent by sid.
 func popAgent(sid cfacade.SID) (*Agent, bool) {
+	sidCountMu.Lock()
+	defer sidCountMu.Unlock()
 	agentValue, found := sidAgentMap.LoadAndDelete(sid)
 	if !found {
 		return nil, false
 	}
+	sidCount--
 	return agentValue.(*Agent), true
 }
 
@@ -125,10 +133,7 @@ func ForeachAgent(fn func(a *Agent)) {
 
 // Count returns the total number of connected agents.
 func Count() int {
-	count := 0
-	sidAgentMap.Range(func(key, value any) bool {
-		count += 1
-		return true
-	})
-	return count
+	sidCountMu.Lock()
+	defer sidCountMu.Unlock()
+	return sidCount
 }

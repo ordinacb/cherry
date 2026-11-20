@@ -36,6 +36,7 @@ type (
 		timerHint          int                   // time wheel nodeMap pre-alloc hint
 		localMailboxLimit  int32
 		remoteMailboxDepth atomic.Int64
+		slowMessages       *slowMessageLog
 	}
 )
 
@@ -52,6 +53,7 @@ func NewSystem() *System {
 		arrivalTimeOut:    100,
 		executionTimeout:  100,
 		localMailboxLimit: defaultLocalMailboxSize,
+		slowMessages:      newSlowMessageLog(),
 	}
 
 	return system
@@ -75,6 +77,7 @@ func (p *System) Start(app cfacade.IApplication) {
 	}
 
 	p.app = app
+	p.slowMessages.start()
 
 	if p.timeWheel == nil {
 		p.timeWheel = ctimeWheel.NewTimeWheelWithHint(p.timerTick, p.timerHint)
@@ -123,6 +126,7 @@ func (p *System) Stop() {
 
 	clog.Info("[OnStop] actor system stopping!")
 	p.wg.Wait()
+	p.slowMessages.stop()
 	clog.Info("[OnStop] actor system stopped!")
 }
 
