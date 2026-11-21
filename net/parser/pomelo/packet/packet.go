@@ -114,35 +114,44 @@ func Encode(typ byte, data []byte) ([]byte, error) {
 }
 
 func Read(conn net.Conn) ([]*Packet, bool, error) {
-	header, err := io.ReadAll(io.LimitReader(conn, int64(HeadLength)))
-	if err != nil {
-		return nil, true, err
-	}
-
-	// if the header has no data, we can consider it as a closed connection
-	if len(header) == 0 {
+	header := make([]byte, HeadLength)
+	if _, err := io.ReadFull(conn, header); err == io.EOF {
 		return nil, true, cerr.PacketConnectClosed
-	}
-
-	msgSize, err := ParseHeader(header)
-	if err != nil {
+	} else if err == io.ErrUnexpectedEOF {
+		return nil, true, cerr.PacketInvalidHeader
+	} else if err != nil {
 		return nil, true, err
 	}
 
-	msgData, err := io.ReadAll(io.LimitReader(conn, int64(msgSize)))
+	size, err := ParseHeader(header)
 	if err != nil {
 		return nil, true, err
 	}
-
-	if len(msgData) < msgSize {
-		return nil, true, cerr.PacketMsgSmallerThanExpected
-	}
-
-	header = append(header, msgData...)
-	packets, err := Decode(header)
+	data, err := readBody(conn, size)
 	if err != nil {
-		return nil, false, err
+		return nil, true, err
 	}
+	return []*Packet{{typ: header[0], len: size, data: data}}, false, nil
+}
 
-	return packets, false, nil
+func readBody(conn net.Conn, size int) ([]byte, error) {
+	// Allocate small bodies directly. Grow the buffer as data arrives for
+	// larger bodies so a partial frame cannot reserve its entire declared size.
+	const smallBodyLimit = 512
+	if size <= smallBodyLimit {
+		data := make([]byte, size)
+		_, err := io.ReadFull(conn, data)
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			return nil, cerr.PacketMsgSmallerThanExpected
+		}
+		return data, err
+	}
+	data, err := io.ReadAll(io.LimitReader(conn, int64(size)))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) < size {
+		return nil, cerr.PacketMsgSmallerThanExpected
+	}
+	return data, nil
 }
