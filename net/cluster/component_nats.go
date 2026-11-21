@@ -228,10 +228,23 @@ func (p *Component) remoteTypeProcess() {
 	}
 }
 
+func (p *Component) nodeType(nodeID string) (string, bool) {
+	discovery := p.App().Discovery()
+	if lookup, ok := discovery.(interface{ GetType(string) (string, error) }); ok {
+		nodeType, err := lookup.GetType(nodeID)
+		return nodeType, err == nil
+	}
+	member, found := discovery.GetMember(nodeID)
+	if !found {
+		return "", false
+	}
+	return member.GetNodeType(), true
+}
+
 func (p *Component) PublishLocal(nodeID string, msg *cfacade.Message) error {
 	defer msg.Recycle()
 
-	member, found := p.App().Discovery().GetMember(nodeID)
+	nodeType, found := p.nodeType(nodeID)
 	if !found {
 		clog.Warnf("[PublishLocal] NodeID not found in discovery. [nodeID = %s]", nodeID)
 		return cerror.DiscoveryNotFoundNode
@@ -246,7 +259,6 @@ func (p *Component) PublishLocal(nodeID string, msg *cfacade.Message) error {
 		return cerror.ClusterPacketMarshalFail
 	}
 
-	nodeType := member.GetNodeType()
 	subject := p.GetLocalSubject(p.prefix, nodeType, nodeID)
 	err = p.localPublisher(nodeType, msg.Target).Publish(subject, bytes)
 	if err != nil {
@@ -264,7 +276,7 @@ func (p *Component) PublishLocal(nodeID string, msg *cfacade.Message) error {
 func (p *Component) PublishRemote(nodeID string, msg *cfacade.Message) error {
 	defer msg.Recycle()
 
-	member, found := p.App().Discovery().GetMember(nodeID)
+	nodeType, found := p.nodeType(nodeID)
 	if !found {
 		clog.Warnf("[PublishRemote] NodeID not found in discovery. [nodeID = %s]", nodeID)
 		return cerror.DiscoveryNotFoundNode
@@ -279,7 +291,6 @@ func (p *Component) PublishRemote(nodeID string, msg *cfacade.Message) error {
 		return cerror.ClusterPacketMarshalFail
 	}
 
-	nodeType := member.GetNodeType()
 	subject := p.GetRemoteSubject(p.prefix, nodeType, nodeID)
 	err = p.publishConnect.Publish(subject, bytes)
 	if err != nil {
@@ -331,7 +342,7 @@ func (p *Component) PublishRemoteType(nodeType string, msg *cfacade.Message) err
 func (p *Component) RequestRemote(nodeID string, msg *cfacade.Message, timeout ...time.Duration) ([]byte, int32) {
 	defer msg.Recycle()
 
-	member, found := p.App().Discovery().GetMember(nodeID)
+	nodeType, found := p.nodeType(nodeID)
 	if !found {
 		clog.Warnf("[RequestRemote] NodeID not found in discovery. [nodeID = %s]", nodeID)
 		return nil, ccode.DiscoveryNotFoundNode
@@ -347,7 +358,6 @@ func (p *Component) RequestRemote(nodeID string, msg *cfacade.Message, timeout .
 		return nil, ccode.RPCMarshalError
 	}
 
-	nodeType := member.GetNodeType()
 	subject := p.GetRemoteSubject(p.prefix, nodeType, nodeID)
 
 	natsData, err := p.RequestSync(subject, reqBytes, timeout...)

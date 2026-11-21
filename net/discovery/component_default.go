@@ -137,6 +137,23 @@ func (n *ComponentDefault) ListByType(nodeType string, filterNodeID ...string) [
 	return memberList
 }
 
+// NodeIDsByType returns a caller-owned list of node IDs from the current membership.
+// Routing callers need only the IDs and can skip cloning the member settings.
+func (n *ComponentDefault) NodeIDsByType(nodeType string) []string {
+	n.memberMu.RLock()
+	defer n.memberMu.RUnlock()
+
+	ids := make([]string, 0, 4)
+	n.memberMap.Range(func(_, value any) bool {
+		member := value.(cfacade.IMember)
+		if member.GetNodeType() == nodeType {
+			ids = append(ids, member.GetNodeID())
+		}
+		return true
+	})
+	return ids
+}
+
 // Random returns a random member of the given nodeType.
 // Returns nil, false if no members of that type exist.
 func (n *ComponentDefault) Random(nodeType string) (cfacade.IMember, bool) {
@@ -155,12 +172,15 @@ func (n *ComponentDefault) Random(nodeType string) (cfacade.IMember, bool) {
 }
 
 // GetType returns the node type for the given nodeID.
-func (n *ComponentDefault) GetType(nodeID string) (nodeType string, err error) {
-	member, found := n.GetMember(nodeID)
-	if !found {
-		return "", cerr.Errorf("nodeID = %s not found.", nodeID)
+func (n *ComponentDefault) GetType(nodeID string) (string, error) {
+	if nodeID != "" {
+		n.memberMu.RLock()
+		defer n.memberMu.RUnlock()
+		if value, found := n.memberMap.Load(nodeID); found {
+			return value.(cfacade.IMember).GetNodeType(), nil
+		}
 	}
-	return member.GetNodeType(), nil
+	return "", cerr.Errorf("nodeID = %s not found.", nodeID)
 }
 
 // GetMember looks up a member by nodeID. Returns nil, false if not found or nodeID is empty.
