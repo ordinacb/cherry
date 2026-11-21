@@ -2,6 +2,7 @@ package cherryCluster
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	ccode "github.com/cherry-game/cherry/code"
@@ -30,6 +31,9 @@ type (
 		remoteNodeTypeSubject string         // remote node type subject
 		publishConnect        *cnats.Connect // send: Publish/Request/ReplySync
 		subscribeConnect      *cnats.Connect // receive: Subscribe
+		localPublishConnect   *cnats.Connect // optional publisher for one frontend Local destination
+		localPublishNodeType  string
+		localPublishActorID   string
 	}
 
 	natsSubjects struct {
@@ -70,6 +74,9 @@ func (p *Component) Init() {
 }
 
 func (p *Component) OnStop() {
+	if p.localPublishConnect != nil {
+		p.localPublishConnect.Close()
+	}
 	if p.publishConnect != nil {
 		p.publishConnect.Close()
 	}
@@ -104,9 +111,41 @@ func (p *Component) loadNatsConfig() {
 	p.publishConnect.Connect()
 	p.subscribeConnect.Connect()
 
+	if p.App().IsFrontend() {
+		if target := natsConfig.GetString("frontend_local_publish_target"); target != "" {
+			p.connectLocalPublisher(natsConfig, target)
+		}
+	}
+
 	if err = p.publishConnect.SubscribeReply(p.replySubject); err != nil {
 		panic(err)
 	}
+}
+
+func (p *Component) connectLocalPublisher(config cfacade.ProfileJSON, target string) {
+	nodeType, actorID, ok := strings.Cut(target, ".")
+	if !ok || nodeType == "" || actorID == "" || strings.Contains(actorID, ".") {
+		panic("frontend_local_publish_target must be nodeType.actorID")
+	}
+	publisher, err := cnats.NewConnectFromConfig(config, "cluster-local-publish")
+	if err != nil {
+		panic(err)
+	}
+	publisher.Connect()
+	p.localPublishConnect = publisher
+	p.localPublishNodeType, p.localPublishActorID = nodeType, actorID
+}
+
+func (p *Component) localPublisher(nodeType, path string) *cnats.Connect {
+	if p.localPublishConnect == nil || nodeType != p.localPublishNodeType {
+		return p.publishConnect
+	}
+	_, pathWithoutNode, _ := strings.Cut(path, ".")
+	actorID, _, _ := strings.Cut(pathWithoutNode, ".")
+	if actorID == p.localPublishActorID {
+		return p.localPublishConnect
+	}
+	return p.publishConnect
 }
 
 func (p *Component) localProcess() {
@@ -209,7 +248,7 @@ func (p *Component) PublishLocal(nodeID string, msg *cfacade.Message) error {
 
 	nodeType := member.GetNodeType()
 	subject := p.GetLocalSubject(p.prefix, nodeType, nodeID)
-	err = p.publishConnect.Publish(subject, bytes)
+	err = p.localPublisher(nodeType, msg.Target).Publish(subject, bytes)
 	if err != nil {
 		clog.Warnf("[PublishLocal] Nats publish fail. [nodeID = %s, err = %v]",
 			nodeID,
