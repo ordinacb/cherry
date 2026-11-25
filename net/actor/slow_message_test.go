@@ -23,12 +23,28 @@ type blockedSlowLogSink struct {
 	bytes.Buffer
 }
 
-// A stalled log sink may retain only a bounded number of diagnostic groups;
-// excess groups still contribute to a visible aggregate instead of blocking Actors.
+func TestSlowMessageRecordDefersAggregation(t *testing.T) {
+	s := newSlowMessageLog()
+	key := slowMessageKey{mailbox: RemoteName, phase: "arrival", target: "gate.user-out-0", method: "response"}
+	s.record(key, "first", 101, 100, 1000)
+	s.record(key, "worst", 250, 100, 1001)
+	if len(s.pending) != 0 {
+		t.Fatal("record aggregated slow messages on the Actor's goroutine")
+	}
+	var got slowMessageStat
+	s.write = func(_ slowMessageKey, stat slowMessageStat, _ bool) { got = stat }
+	s.flush()
+	if got.count != 2 || got.maxMS != 250 || got.source != "worst" {
+		t.Fatalf("pending samples were not aggregated: %+v", got)
+	}
+}
+
+// A stalled log sink retains a bounded number of diagnostic samples and groups.
+// Excess samples are counted without blocking Actors.
 func TestSlowMessageLogBoundsGroupsWhileWriterBlocked(t *testing.T) {
 	s := newSlowMessageLog()
 	entered, release, flushed := make(chan struct{}), make(chan struct{}), make(chan struct{})
-	var total, overflow, maxMS int64
+	var total, overflow, inboxOverflow, maxMS int64
 	var once sync.Once
 	s.write = func(_ slowMessageKey, stat slowMessageStat, over bool) {
 		once.Do(func() { close(entered); <-release })
@@ -40,15 +56,23 @@ func TestSlowMessageLogBoundsGroupsWhileWriterBlocked(t *testing.T) {
 			maxMS = stat.maxMS
 		}
 	}
+	s.writeInboxOverflow = func(mailbox, phase string, count int64) {
+		if mailbox != RemoteName || phase != "arrival" {
+			t.Errorf("wrong inbox overflow: %s/%s", mailbox, phase)
+		}
+		inboxOverflow += count
+	}
 	s.record(slowMessageKey{target: "initial"}, "source", 101, 100, 1000)
 	go func() { defer close(flushed); s.flush() }()
 	<-entered
 	var producers sync.WaitGroup
-	for worker := range 8 {
+	const workers = 8
+	const perWorker = slowMessageInboxSize / workers * 2
+	for worker := range workers {
 		producers.Add(1)
 		go func() {
 			defer producers.Done()
-			for i := range 512 {
+			for i := range perWorker {
 				s.record(slowMessageKey{target: fmt.Sprintf("%d-%d", worker, i)}, "source", 999, 100, 2000)
 			}
 		}()
@@ -63,12 +87,13 @@ func TestSlowMessageLogBoundsGroupsWhileWriterBlocked(t *testing.T) {
 	close(release)
 	<-produced
 	<-flushed
-	if len(s.pending) != slowMessageGroups {
-		t.Fatalf("retained %d groups", len(s.pending))
+	if len(s.inbox) != slowMessageInboxSize || len(s.pending) != 0 {
+		t.Fatalf("retained %d samples and %d groups", len(s.inbox), len(s.pending))
 	}
 	s.stop()
-	if total != 4097 || overflow != 4096-slowMessageGroups || maxMS != 999 {
-		t.Fatalf("counts lost: total=%d overflow=%d max_ms=%d", total, overflow, maxMS)
+	if total != slowMessageInboxSize+1 || overflow != slowMessageInboxSize-slowMessageGroups ||
+		inboxOverflow != workers*perWorker-slowMessageInboxSize || maxMS != 999 {
+		t.Fatalf("counts lost: total=%d overflow=%d inbox_overflow=%d max_ms=%d", total, overflow, inboxOverflow, maxMS)
 	}
 }
 
@@ -94,7 +119,7 @@ func TestSlowMessageLogKeepsPhasesAndWorstSource(t *testing.T) {
 		t.Fatalf("bad aggregate: %+v", rows)
 	}
 	s.record(key, "late", 999, 100, 2000)
-	if len(s.pending) != 0 {
+	if len(s.inbox) != 0 {
 		t.Fatal("closed reporter retained diagnostics")
 	}
 }

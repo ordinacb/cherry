@@ -2,12 +2,16 @@ package cherryActor
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	clog "github.com/cherry-game/cherry/logger"
 )
 
-const slowMessageGroups = 256
+const (
+	slowMessageGroups    = 256
+	slowMessageInboxSize = 4096
+)
 
 type slowMessageKey struct {
 	mailbox, phase, target, method string
@@ -23,47 +27,75 @@ type slowMessageOverflow struct {
 	stat slowMessageStat
 }
 
-// slowMessageLog aggregates diagnostics independently of Actor delivery. The active
-// and flushing maps are bounded; no Actor waits for a logger or an output pipe.
+type slowMessageSample struct {
+	key                slowMessageKey
+	source             string
+	elapsed, limit, at int64
+}
+
+// slowMessageLog accepts bounded diagnostic samples from Actors. Only the
+// background worker aggregates them and writes to the log sink.
 type slowMessageLog struct {
-	mu           sync.Mutex
-	pending      map[slowMessageKey]slowMessageStat
-	overflow     [4]slowMessageOverflow
-	closed       bool
-	stopCh, done chan struct{}
-	write        func(slowMessageKey, slowMessageStat, bool)
+	mu                 sync.RWMutex // Serializes submission with shutdown only.
+	closed             bool
+	inbox              chan slowMessageSample
+	inboxOverflow      [4]atomic.Int64
+	pending            map[slowMessageKey]slowMessageStat
+	overflow           [4]slowMessageOverflow
+	stopCh, done       chan struct{}
+	write              func(slowMessageKey, slowMessageStat, bool)
+	writeInboxOverflow func(mailbox, phase string, count int64)
 }
 
 func newSlowMessageLog() *slowMessageLog {
-	return &slowMessageLog{pending: make(map[slowMessageKey]slowMessageStat), write: writeSlowMessage}
+	return &slowMessageLog{
+		inbox:   make(chan slowMessageSample, slowMessageInboxSize),
+		pending: make(map[slowMessageKey]slowMessageStat, slowMessageGroups),
+		write:   writeSlowMessage,
+		writeInboxOverflow: func(mailbox, phase string, count int64) {
+			clog.Warnw("actor_message_slow_inbox_overflow", "mailbox", mailbox, "phase", phase, "count", count)
+		},
+	}
 }
 
 func (s *slowMessageLog) record(key slowMessageKey, source string, elapsed, limit, at int64) {
 	if s == nil {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return
+	s.mu.RLock()
+	if !s.closed {
+		select {
+		case s.inbox <- slowMessageSample{key, source, elapsed, limit, at}:
+		default:
+			s.inboxOverflow[slowMessageLane(key)].Add(1)
+		}
 	}
+	s.mu.RUnlock()
+}
+
+func slowMessageLane(key slowMessageKey) int {
+	index := 0
+	if key.mailbox == LocalName {
+		index += 2
+	}
+	if key.phase == "execution" {
+		index++
+	}
+	return index
+}
+
+func (s *slowMessageLog) aggregate(sample slowMessageSample) {
+	key := sample.key
 	stat, found := s.pending[key]
 	if !found && len(s.pending) >= slowMessageGroups {
-		index := 0
-		if key.mailbox == LocalName {
-			index += 2
-		}
-		if key.phase == "execution" {
-			index++
-		}
-		bucket := &s.overflow[index]
-		if elapsed > bucket.stat.maxMS {
+		bucket := &s.overflow[slowMessageLane(key)]
+		if sample.elapsed > bucket.stat.maxMS {
 			bucket.key = key
 		}
-		bucket.stat.add(source, elapsed, limit, at)
+		bucket.stat.add(sample.source, sample.elapsed, sample.limit, sample.at)
 		return
 	}
-	stat.add(source, elapsed, limit, at)
+	stat.add(sample.source, sample.elapsed, sample.limit, sample.at)
 	s.pending[key] = stat
 }
 
@@ -116,21 +148,24 @@ func (s *slowMessageLog) stop() {
 }
 
 func (s *slowMessageLog) flush() {
-	s.mu.Lock()
-	if len(s.pending) == 0 {
-		s.mu.Unlock()
-		return
+	for range len(s.inbox) {
+		s.aggregate(<-s.inbox)
 	}
-	batch, overflow := s.pending, s.overflow
-	s.pending = make(map[slowMessageKey]slowMessageStat)
-	s.overflow = [4]slowMessageOverflow{}
-	s.mu.Unlock()
-	for key, stat := range batch {
+	for key, stat := range s.pending {
 		s.write(key, stat, false)
 	}
-	for _, bucket := range overflow {
+	clear(s.pending)
+	for _, bucket := range s.overflow {
 		if bucket.stat.count > 0 {
 			s.write(bucket.key, bucket.stat, true)
+		}
+	}
+	clear(s.overflow[:])
+	mailboxes := [...]string{RemoteName, LocalName}
+	phases := [...]string{"arrival", "execution"}
+	for index := range s.inboxOverflow {
+		if count := s.inboxOverflow[index].Swap(0); count > 0 {
+			s.writeInboxOverflow(mailboxes[index/2], phases[index%2], count)
 		}
 	}
 }
