@@ -87,7 +87,7 @@ func (p *Message) Marshal() ([]byte, error) {
 		cp.ArgBytes = argBytes
 	}
 
-	return proto.Marshal(cp)
+	return marshalClusterPacket(cp)
 }
 
 // Unmarshal deserializes cross-process transfer data back into Message.
